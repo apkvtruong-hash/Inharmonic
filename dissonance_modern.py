@@ -23,15 +23,22 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import wave
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 
-from PySide6.QtCore import Qt, QThread, Signal, QRectF, QSize, QTimer, QPointF
-from PySide6.QtGui import (QColor, QFont, QImage, QPainter, QPalette, QPen,
-                           QShortcut, QKeySequence, QVector4D)
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QComboBox, QFrame,
+from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QSize, QSizeF, QTimer,
+                            QPointF, QMarginsF)
+from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QImage, QLinearGradient,
+                           QPageSize, QPainter, QPalette, QPdfWriter, QPen,
+                           QPixmap, QShortcut, QKeySequence, QTextDocument,
+                           QVector3D, QVector4D)
+from PySide6.QtSvg import QSvgGenerator
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
+                               QDialog, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QFrame,
                                QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow,
                                QProgressBar, QPushButton, QScrollArea,
@@ -54,6 +61,10 @@ except Exception:  # pragma: no cover - depends on local OpenGL support
 
 SAMPLE_RATE = 44100
 DURATION = 1.5
+
+# Curve and surface are always evaluated out to this ratio so minima beyond the
+# default MAX RATIO still get found.
+EXTENDED_MAX = 3.3
 
 
 def amp_to_loudness(amp):
@@ -203,8 +214,9 @@ def compute_dissonance_3d(spec_a, spec_b, spec_c, ref_freq, max_interval, step_s
             bc_l1[np.newaxis, :], bc_l2[np.newaxis, :]
         ).sum(axis=1)
 
-        z_data[ri, :] = (d_aa + d_bb_all[ri] + d_ab_all[ri] +
-                         d_cc_all + d_ac_all + d_bc) / 2.0
+        # Self terms count each pair twice; cross terms already count each pair once.
+        z_data[ri, :] = ((d_aa + d_bb_all[ri] + d_cc_all) / 2.0 +
+                         d_ab_all[ri] + d_ac_all + d_bc)
 
     max_z = z_data.max()
     if max_z > 0:
@@ -261,32 +273,35 @@ def find_minima(ratios, dissonance_values, window=5, min_prominence=0.0000135):
 def find_minima_3d(ratios_x, ratios_y, z_data, window=5, top_n=10):
     """Find the most consonant triads (lowest dissonance local minima).
 
-    A grid point is a local minimum if it's the smallest value in its
-    (2*window+1) x (2*window+1) neighbourhood.  Results are sorted by
-    absolute dissonance (lowest first) and capped at *top_n*.
+    *z_data* is indexed ``[voice B index, voice C index]``.  A grid point is a
+    local minimum if it's the smallest value in its (2*window+1) x (2*window+1)
+    neighbourhood.  Results are sorted by absolute dissonance (lowest first)
+    and capped at *top_n*.
     """
-    ny, nx = z_data.shape
-    candidates = []
+    nx, ny = z_data.shape
+    # The surface is symmetric only when B and C share a spectrum; mirrored pairs
+    # are duplicate voicings then, and genuinely different chords otherwise.
+    mirrored = nx == ny and np.allclose(z_data, z_data.T)
+    win = 2 * window + 1
+    if nx < win or ny < win:
+        return np.array([]), np.array([]), np.array([])
 
-    for i in range(window, ny - window):
-        for j in range(window, nx - window):
-            patch = z_data[i - window:i + window + 1, j - window:j + window + 1]
-            if z_data[i, j] == patch.min():
-                candidates.append((i, j))
+    # A square-window minimum is separable: min over rows, then over columns.
+    row_min = np.lib.stride_tricks.sliding_window_view(z_data, win, axis=0).min(axis=-1)
+    patch_min = np.lib.stride_tricks.sliding_window_view(row_min, win, axis=1).min(axis=-1)
+    core = z_data[window:nx - window, window:ny - window]
+    ii, jj = np.nonzero(core == patch_min)
+    candidates = zip(ii + window, jj + window)
 
     results = []
     tol = 0.02  # tolerance for "same note" check
     for i, j in candidates:
-        bx = ratios_x[j]
-        cy = ratios_y[i]
-        # Only keep notes strictly within one octave (ratio < 2)
-        if bx >= 2.0 - tol or cy >= 2.0 - tol:
-            continue
+        bx = ratios_x[i]
+        cy = ratios_y[j]
         # Skip triads where two voices are effectively the same pitch
         if abs(bx - 1.0) < tol or abs(cy - 1.0) < tol or abs(bx - cy) < tol:
             continue
-        # Keep only B >= C (below the x=y diagonal) to avoid mirror duplicates
-        if bx < cy:
+        if mirrored and bx < cy:
             continue
         results.append((bx, cy, z_data[i, j]))
 
@@ -295,7 +310,8 @@ def find_minima_3d(ratios_x, ratios_y, z_data, window=5, top_n=10):
 
     # Sort by dissonance (most consonant first), keep top_n
     results.sort(key=lambda t: t[2])
-    results = results[:top_n]
+    if top_n is not None:
+        results = results[:top_n]
 
     rx, ry, rz = zip(*results)
     return np.array(rx), np.array(ry), np.array(rz)
@@ -305,9 +321,10 @@ def synthesize_multi(spectra_and_ratios, ref_freq, duration=DURATION):
     """Synthesize multiple voices, each with its own spectrum and pitch ratio."""
     t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
     envelope = np.ones_like(t)
-    fade = int(0.05 * SAMPLE_RATE)
-    envelope[:fade] = np.linspace(0, 1, fade)
-    envelope[-fade:] = np.linspace(1, 0, fade)
+    fade = min(int(0.05 * SAMPLE_RATE), len(t) // 2)
+    if fade > 0:
+        envelope[:fade] = np.linspace(0, 1, fade)
+        envelope[-fade:] = np.linspace(1, 0, fade)
 
     signal = np.zeros_like(t)
     for spectrum, ratio in spectra_and_ratios:
@@ -329,6 +346,19 @@ def play_multi(spectra_and_ratios, ref_freq):
     signal = synthesize_multi(spectra_and_ratios, ref_freq)
     sd.stop()
     sd.play(signal, SAMPLE_RATE)
+
+
+def write_wav(path, signal, sample_rate=SAMPLE_RATE):
+    """Write a mono 24-bit PCM WAV (lossless) from a float signal in [-1, 1]."""
+    clipped = np.clip(np.asarray(signal, dtype=np.float64), -1.0, 1.0)
+    # 2**23 - 1 keeps +1.0 from wrapping to the most negative code.
+    ints = np.rint(clipped * (2 ** 23 - 1)).astype('<i4')
+    packed = ints.view(np.uint8).reshape(-1, 4)[:, :3]  # little-endian low 3 bytes
+    with wave.open(str(path), 'wb') as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(3)
+        fh.setframerate(sample_rate)
+        fh.writeframes(np.ascontiguousarray(packed).tobytes())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -367,11 +397,28 @@ def ratio_to_cents(ratio):
 
 PRESETS = [
     ("Harmonic", [1, 2, 3, 4, 5, 6], [1, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 6]),
-    ("Odd harmonics (square)", [1, 3, 5, 7, 9, 11], [0.88 ** i for i in range(6)]),
-    ("Free beam (xylophone)", [1, 2.758, 5.406, 8.936, 13.35, 18.645],
+    ("Odd harmonics (square)", [1, 3, 5, 7, 9, 11],
+     [1, 1 / 3, 1 / 5, 1 / 7, 1 / 9, 1 / 11]),
+    ("Free beam (glockenspiel)", [1, 2.758, 5.406, 8.936, 13.35, 18.645],
      [0.88 ** i for i in range(6)]),
     ("Bonang", [1, 1.52, 3.46, 3.92], [0.88 ** i for i in range(4)]),
 ]
+
+PRESET_NOTES = {
+    "Harmonic":
+        "Harmonic partials 1\u20136 at 1/n: an ideal sawtooth, not a measured instrument.",
+    "Odd harmonics (square)":
+        "Odd partials 1\u201311 at 1/n: an ideal square wave. Real clarinets and pan flutes "
+        "are mostly odd but still have some even content.",
+    "Free beam (glockenspiel)":
+        "Free\u2013free Euler\u2013Bernoulli bar (mode ratios exact to <0.06%), "
+        "like a glockenspiel bar. Real xylophone and marimba bars are undercut to retune "
+        "these. Amplitudes are Sethares' generic 0.88\u207f roll-off.",
+    "Bonang":
+        "Javanese kettle-gong after Sethares; 1, 1.52 and 3.46 match TTSS \u00a76.7, "
+        "3.92 is unconfirmed. Gamelans are individually tuned, so no spectrum is canonical. "
+        "Amplitudes are a generic 0.88\u207f roll-off, not measured.",
+}
 
 DEFAULT_FREQS = [1, 2, 3, 4, 5, 6]
 DEFAULT_AMPS = [1, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 6]
@@ -381,27 +428,65 @@ DEFAULT_AMPS = [1, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 6]
 #  Theme
 # ═══════════════════════════════════════════════════════════════════════════
 
-CRUST = "#0e0e16"
-BASE = "#11111b"
-MANTLE = "#181825"
-SURFACE = "#1e1e2e"
-PANEL = "#313244"
-LINE = "#26263a"
-BORDER = "#45475a"
-TEXT = "#cdd6f4"
-SUBTEXT = "#a6adc8"
-MUTED = "#6c7086"
-BLUE = "#89b4fa"
-SKY = "#89dceb"
-YELLOW = "#f9e2af"
-GREEN = "#a6e3a1"
-RED = "#f38ba8"
-MAUVE = "#cba6f7"
-PEACH = "#fab387"
+DARK_PALETTE = dict(
+    CRUST="#0e0e16", BASE="#11111b", MANTLE="#181825", SURFACE="#1e1e2e",
+    PANEL="#313244", LINE="#26263a", BORDER="#45475a", TEXT="#cdd6f4",
+    SUBTEXT="#a6adc8", MUTED="#6c7086", BLUE="#89b4fa", SKY="#89dceb",
+    YELLOW="#f9e2af", GREEN="#a6e3a1", RED="#f38ba8", MAUVE="#cba6f7",
+    PEACH="#fab387", CMAP="magma", PLOT_LW=2.0, GRID_ALPHA=0.12,
+    MARKER_EDGE="#ffffff", TICK_LEVEL=2,
+    VOICE_A="#5aa9ff", VOICE_B="#ff8a3d", VOICE_C="#3ddc97",
+)
 
-VOICE_COLORS = {"A": BLUE, "B": MAUVE, "C": PEACH}
+# Okabe-Ito colourblind-safe accents on white; intended for print figures.
+PAPER_PALETTE = dict(
+    CRUST="#ffffff", BASE="#ffffff", MANTLE="#ffffff", SURFACE="#f4f4f4",
+    PANEL="#c8c8c8", LINE="#dcdcdc", BORDER="#000000", TEXT="#000000",
+    SUBTEXT="#1a1a1a", MUTED="#555555", BLUE="#0072b2", SKY="#56b4e9",
+    YELLOW="#d55e00", GREEN="#009e73", RED="#b22222", MAUVE="#cc79a7",
+    PEACH="#e69f00", CMAP="viridis", PLOT_LW=1.6, GRID_ALPHA=0.25,
+    MARKER_EDGE="#000000", TICK_LEVEL=0,
+    VOICE_A="#0072b2", VOICE_B="#d55e00", VOICE_C="#009e73",
+)
 
-QSS = f"""
+# Declared explicitly so static analysis sees them; apply_palette() rebinds them.
+CRUST = DARK_PALETTE["CRUST"]
+BASE = DARK_PALETTE["BASE"]
+MANTLE = DARK_PALETTE["MANTLE"]
+SURFACE = DARK_PALETTE["SURFACE"]
+PANEL = DARK_PALETTE["PANEL"]
+LINE = DARK_PALETTE["LINE"]
+BORDER = DARK_PALETTE["BORDER"]
+TEXT = DARK_PALETTE["TEXT"]
+SUBTEXT = DARK_PALETTE["SUBTEXT"]
+MUTED = DARK_PALETTE["MUTED"]
+BLUE = DARK_PALETTE["BLUE"]
+SKY = DARK_PALETTE["SKY"]
+YELLOW = DARK_PALETTE["YELLOW"]
+GREEN = DARK_PALETTE["GREEN"]
+RED = DARK_PALETTE["RED"]
+MAUVE = DARK_PALETTE["MAUVE"]
+PEACH = DARK_PALETTE["PEACH"]
+CMAP = DARK_PALETTE["CMAP"]
+PLOT_LW = DARK_PALETTE["PLOT_LW"]
+GRID_ALPHA = DARK_PALETTE["GRID_ALPHA"]
+MARKER_EDGE = DARK_PALETTE["MARKER_EDGE"]
+TICK_LEVEL = DARK_PALETTE["TICK_LEVEL"]
+
+# Blue / orange / green: the most separable Okabe-Ito triple, colour-blind safe.
+VOICE_COLORS = {k: DARK_PALETTE[f"VOICE_{k}"] for k in "ABC"}
+CURRENT_PALETTE = DARK_PALETTE
+
+
+def apply_palette(palette):
+    """Rebind the module-level colour names; widgets then re-read them."""
+    global CURRENT_PALETTE
+    CURRENT_PALETTE = palette
+    globals().update(palette)
+    VOICE_COLORS.update({k: palette[f"VOICE_{k}"] for k in "ABC"})
+
+
+QSS = """
 * {{ outline: none; }}
 
 QWidget {{
@@ -412,6 +497,7 @@ QWidget {{
 }}
 
 QLabel {{ background: transparent; }}
+#plain {{ background: transparent; }}
 
 #appTitle   {{ font-size: 19px; font-weight: 700; color: {TEXT}; letter-spacing: 0.5px; }}
 #appSub     {{ font-size: 11px; color: {MUTED}; letter-spacing: 2.2px; font-weight: 600; }}
@@ -435,18 +521,19 @@ QLabel {{ background: transparent; }}
 
 #dot {{ border-radius: 4px; }}
 
-QLineEdit, QComboBox {{
+QLineEdit, QComboBox, QDoubleSpinBox {{
     background: {SURFACE};
     border: 1px solid {PANEL};
     border-radius: 8px;
-    padding: 6px 10px;
+    padding: 4px 8px;
     color: {TEXT};
     selection-background-color: {BLUE};
     selection-color: {BASE};
 }}
-QLineEdit:hover, QComboBox:hover {{ border-color: {BORDER}; }}
-QLineEdit:focus, QComboBox:focus {{ border-color: {BLUE}; }}
+QLineEdit:hover, QComboBox:hover, QDoubleSpinBox:hover {{ border-color: {BORDER}; }}
+QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {{ border-color: {BLUE}; }}
 QLineEdit[invalid="true"] {{ border-color: {RED}; }}
+QCheckBox {{ background: transparent; spacing: 8px; }}
 
 QComboBox::drop-down {{ border: none; width: 24px; background: transparent; }}
 QComboBox::down-arrow {{
@@ -468,7 +555,7 @@ QPushButton {{
     background: {SURFACE};
     border: 1px solid {PANEL};
     border-radius: 8px;
-    padding: 7px 14px;
+    padding: 5px 12px;
     color: {TEXT};
 }}
 QPushButton:hover  {{ background: {PANEL}; border-color: {BORDER}; }}
@@ -476,7 +563,7 @@ QPushButton:pressed {{ background: {BORDER}; }}
 
 QPushButton#primary {{
     background: {BLUE}; color: {BASE}; border: none; font-weight: 700;
-    padding: 9px 16px;
+    padding: 6px 16px;
 }}
 QPushButton#primary:hover  {{ background: #a3c6ff; }}
 QPushButton#primary:pressed {{ background: #6f9de6; }}
@@ -487,14 +574,14 @@ QPushButton#danger:hover {{ background: {RED}; color: {BASE}; border-color: {RED
 
 QPushButton#icon {{
     background: {SURFACE}; border: 1px solid {PANEL}; border-radius: 8px;
-    padding: 6px 0px; min-width: 34px; color: {GREEN}; font-size: 12px;
+    padding: 4px 0px; min-width: 32px; color: {GREEN}; font-size: 12px;
 }}
 QPushButton#icon:hover {{ background: {GREEN}; color: {BASE}; border-color: {GREEN}; }}
 
 #segment {{ background: {MANTLE}; border: 1px solid {LINE}; border-radius: 10px; }}
 QPushButton#segBtn {{
     background: transparent; border: none; border-radius: 7px;
-    padding: 7px 18px; color: {MUTED}; font-weight: 600;
+    padding: 5px 14px; color: {MUTED}; font-weight: 600;
 }}
 QPushButton#segBtn:hover {{ color: {TEXT}; }}
 QPushButton#segBtn:checked {{ background: {PANEL}; color: {BLUE}; }}
@@ -529,7 +616,8 @@ QToolTip {{
 
 def _chevron(color, hover=False):
     """Render a small chevron to a temp PNG and return a QSS-friendly path."""
-    name = f"dissonance_chevron_{'hover' if hover else 'idle'}.png"
+    # Colour is in the filename so a theme switch can't reuse a cached icon.
+    name = f"dissonance_chevron_{color.lstrip('#')}_{'hover' if hover else 'idle'}.png"
     path = Path(tempfile.gettempdir()) / name
     img = QImage(28, 28, QImage.Format_ARGB32)
     img.fill(Qt.transparent)
@@ -546,9 +634,11 @@ def _chevron(color, hover=False):
     return path.as_posix()
 
 
-def build_qss():
-    return (QSS.replace("__CHEVRON__", _chevron(SUBTEXT))
-               .replace("__CHEVRON_HOVER__", _chevron(BLUE, hover=True)))
+def build_qss(palette=None):
+    pal = palette or CURRENT_PALETTE
+    return (QSS.format(**pal)
+               .replace("__CHEVRON__", _chevron(pal["SUBTEXT"]))
+               .replace("__CHEVRON_HOVER__", _chevron(pal["BLUE"], hover=True)))
 
 
 def mono_font(size=12, bold=False):
@@ -584,18 +674,20 @@ class Card(QFrame):
         super().__init__(parent)
         self.setObjectName("card")
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 12, 14, 14)
-        outer.setSpacing(10)
+        outer.setContentsMargins(12, 9, 12, 10)
+        outer.setSpacing(7)
 
         if title is not None:
             head = QHBoxLayout()
             head.setSpacing(8)
+            self.dot = None
             if accent:
                 dot = QLabel()
                 dot.setObjectName("dot")
                 dot.setFixedSize(8, 8)
                 dot.setStyleSheet(f"background: {accent}; border-radius: 4px;")
                 head.addWidget(dot)
+                self.dot = dot
             lbl = QLabel(title.upper())
             lbl.setObjectName("cardTitle")
             head.addWidget(lbl)
@@ -604,7 +696,7 @@ class Card(QFrame):
             outer.addLayout(head)
 
         self.body = QVBoxLayout()
-        self.body.setSpacing(8)
+        self.body.setSpacing(6)
         outer.addLayout(self.body)
 
 
@@ -639,15 +731,18 @@ class Segmented(QWidget):
 
 
 class Field(QWidget):
-    """Labelled line edit."""
+    """Labelled line edit; *inline* puts the label to the left."""
 
-    def __init__(self, label, value="", width=None, parent=None):
+    def __init__(self, label, value="", width=None, inline=False, label_width=74,
+                 parent=None):
         super().__init__(parent)
-        lay = QVBoxLayout(self)
+        lay = QHBoxLayout(self) if inline else QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
+        lay.setSpacing(8 if inline else 3)
         cap = QLabel(label)
         cap.setObjectName("fieldLabel")
+        if inline:
+            cap.setFixedWidth(label_width)
         lay.addWidget(cap)
         self.edit = QLineEdit(value)
         if width:
@@ -746,85 +841,112 @@ class ResultList(QListWidget):
 #  Spectrum editor
 # ═══════════════════════════════════════════════════════════════════════════
 
-class SpectrumCard(Card):
+class SpectrumCard(QWidget):
     """Editor for one voice's spectrum, with a live partial preview."""
 
     playRequested = Signal(object)
+    sourceChanged = Signal()
 
-    def __init__(self, letter, subtitle, copy_sources=None, parent=None):
-        super().__init__(f"{letter}  \u00b7  {subtitle}", accent=VOICE_COLORS[letter],
-                         parent=parent)
+    def __init__(self, letter, copy_sources=None, parent=None):
+        super().__init__(parent)
         self.letter = letter
         self.copy_sources = copy_sources or []
         self.color = VOICE_COLORS[letter]
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
 
+        top = QHBoxLayout()
+        top.setSpacing(6)
         if self.copy_sources:
             self.copy_combo = QComboBox()
             self.copy_combo.addItems(
                 [f"Same as {name}" for name, _ in self.copy_sources] + ["Custom"])
             self.copy_combo.setCurrentIndex(0)
+            self.copy_combo.setSizeAdjustPolicy(
+                QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            self.copy_combo.setMinimumContentsLength(6)
             self.copy_combo.currentIndexChanged.connect(self._toggle_fields)
-            self.body.addWidget(self.copy_combo)
+            top.addWidget(self.copy_combo, 1)
         else:
             self.copy_combo = None
-
-        self.fields = QWidget()
-        fl = QVBoxLayout(self.fields)
-        fl.setContentsMargins(0, 0, 0, 0)
-        fl.setSpacing(8)
-
-        self.freq_field = Field("PARTIAL RATIOS",
-                                ", ".join(f"{f:.4g}" for f in DEFAULT_FREQS))
-        self.amp_field = Field("AMPLITUDES",
-                               ", ".join(f"{a:.4g}" for a in DEFAULT_AMPS))
-        fl.addWidget(self.freq_field)
-        fl.addWidget(self.amp_field)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
         self.preset_combo = QComboBox()
-        self.preset_combo.addItem("Presets\u2026")
+        self.preset_combo.setToolTip("Spectrum preset")
+        self.preset_combo.addItem("Custom")
         self.preset_combo.addItems([p[0] for p in PRESETS])
+        for i, (name, _, _) in enumerate(PRESETS, start=1):
+            self.preset_combo.setItemData(i, PRESET_NOTES[name], Qt.ToolTipRole)
+        self.preset_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.preset_combo.setMinimumContentsLength(8)
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
-        row.addWidget(self.preset_combo, 1)
+        top.addWidget(self.preset_combo, 1)
         play_btn = QPushButton("\u25b6")
         play_btn.setObjectName("icon")
         play_btn.setToolTip(f"Play voice {letter} alone")
         play_btn.setCursor(Qt.PointingHandCursor)
         play_btn.clicked.connect(lambda: self.playRequested.emit(self))
-        row.addWidget(play_btn, 0)
-        fl.addLayout(row)
+        top.addWidget(play_btn, 0)
+        lay.addLayout(top)
+
+        self.fields = QWidget()
+        self.fields.setObjectName("plain")
+        fl = QVBoxLayout(self.fields)
+        fl.setContentsMargins(0, 0, 0, 0)
+        fl.setSpacing(6)
+
+        self.freq_field = Field("Partials",
+                                ", ".join(f"{f:.4g}" for f in DEFAULT_FREQS),
+                                inline=True)
+        self.amp_field = Field("Amplitudes",
+                               ", ".join(f"{a:.4g}" for a in DEFAULT_AMPS),
+                               inline=True)
+        fl.addWidget(self.freq_field)
+        fl.addWidget(self.amp_field)
 
         self.preview = pg.PlotWidget()
-        self.preview.setFixedHeight(58)
+        self.preview.setFixedHeight(34)
         self.preview.setMouseEnabled(False, False)
         self.preview.setMenuEnabled(False)
         self.preview.hideButtons()
         self.preview.setBackground(SURFACE)
         for axis in ("left", "bottom", "top", "right"):
             self.preview.getPlotItem().hideAxis(axis)
-        self.preview.getPlotItem().setContentsMargins(6, 6, 6, 2)
+        self.preview.getPlotItem().setContentsMargins(6, 4, 6, 2)
         self._bars = pg.BarGraphItem(x=[0], height=[0], width=0.06,
                                      brush=pg.mkBrush(self.color))
         self.preview.addItem(self._bars)
         fl.addWidget(self.preview)
 
-        self.body.addWidget(self.fields)
+        lay.addWidget(self.fields)
+        lay.addStretch(1)
 
         self.freq_field.edit.textChanged.connect(self._refresh_preview)
         self.amp_field.edit.textChanged.connect(self._refresh_preview)
+        self.freq_field.edit.textChanged.connect(self._sync_preset_label)
+        self.amp_field.edit.textChanged.connect(self._sync_preset_label)
 
         self._toggle_fields()
         self._refresh_preview()
+        self._sync_preset_label()
 
     # ── behaviour ──────────────────────────────────────────────────────────
 
+    def apply_palette(self):
+        self.color = VOICE_COLORS[self.letter]
+        self.preview.setBackground(SURFACE)
+        self._bars.setOpts(brush=pg.mkBrush(self.color))
+
+    def is_linked(self):
+        return self.copy_combo is not None and self.copy_combo.currentText() != "Custom"
+
     def _toggle_fields(self):
-        custom = self.copy_combo is None or \
-            self.copy_combo.currentText() == "Custom"
+        custom = not self.is_linked()
         self.fields.setVisible(custom)
+        self.preset_combo.setVisible(custom)
         if not custom:
             self._refresh_preview()
+        self.sourceChanged.emit()
 
     def _apply_preset(self, index):
         if index <= 0:
@@ -832,9 +954,22 @@ class SpectrumCard(Card):
         _, freqs, amps = PRESETS[index - 1]
         self.freq_field.edit.setText(", ".join(f"{f:.4g}" for f in freqs))
         self.amp_field.edit.setText(", ".join(f"{a:.4g}" for a in amps))
+
+    def _sync_preset_label(self):
+        """Show the preset the fields match, or Custom once they've been edited."""
+        current = ("".join(self.freq_field.text().split()),
+                   "".join(self.amp_field.text().split()))
+        index = 0
+        for i, (_, freqs, amps) in enumerate(PRESETS, start=1):
+            if current == (",".join(f"{f:.4g}" for f in freqs),
+                           ",".join(f"{a:.4g}" for a in amps)):
+                index = i
+                break
         self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.setCurrentIndex(index)
         self.preset_combo.blockSignals(False)
+        self.preset_combo.setToolTip(
+            PRESET_NOTES[PRESETS[index - 1][0]] if index else "Spectrum preset")
 
     def _refresh_preview(self):
         spec = self.get_spectrum()
@@ -889,63 +1024,98 @@ class CurveView(pg.PlotWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground(MANTLE)
-        self.showGrid(x=True, y=True, alpha=0.12)
         pi = self.getPlotItem()
-        pi.setLabel('bottom', 'frequency ratio  B / A', color=SUBTEXT, size='10pt')
-        pi.setLabel('left', 'dissonance', color=SUBTEXT, size='10pt')
-        for axis in ('bottom', 'left'):
-            ax = pi.getAxis(axis)
-            ax.setPen(pg.mkPen(BORDER))
-            ax.setTextPen(pg.mkPen(SUBTEXT))
         pi.setMenuEnabled(False)
 
-        self._curve = pi.plot([], [], pen=pg.mkPen(BLUE, width=2),
-                              fillLevel=0.0, brush=pg.mkBrush(137, 180, 250, 32))
-        self._dots = pg.ScatterPlotItem(size=9, pen=pg.mkPen('#ffffff', width=1.0),
-                                        brush=pg.mkBrush(YELLOW))
+        self._curve = pi.plot([], [], fillLevel=0.0)
+        self._dots = pg.ScatterPlotItem(size=9)
         pi.addItem(self._dots)
 
-        self._vline = pg.InfiniteLine(angle=90, movable=False,
-                                      pen=pg.mkPen(MUTED, width=1,
-                                                   style=Qt.DashLine))
+        self._vline = pg.InfiniteLine(angle=90, movable=False)
         self._vline.setVisible(False)
         pi.addItem(self._vline, ignoreBounds=True)
 
-        self._readout = pg.TextItem(anchor=(0, 1), color=TEXT,
-                                    fill=pg.mkBrush(30, 30, 46, 225),
-                                    border=pg.mkPen(PANEL))
+        self._readout = pg.TextItem(anchor=(0, 1))
         self._readout.setVisible(False)
         pi.addItem(self._readout, ignoreBounds=True)
 
         self._labels = []
         self._x = None
         self._y = None
+        self._mx = None
+        self._my = None
+        self._xmax = 2.3
 
+        self.apply_palette()
         self.scene().sigMouseMoved.connect(self._on_move)
         self.scene().sigMouseClicked.connect(self._on_click)
 
+    def apply_palette(self):
+        self.setBackground(MANTLE)
+        self.showGrid(x=True, y=True, alpha=GRID_ALPHA)
+        pi = self.getPlotItem()
+        pi.setLabel('bottom', 'Frequency ratio  B / A', color=SUBTEXT, size='10pt')
+        pi.setLabel('left', 'Sensory dissonance (normalised)', color=SUBTEXT,
+                    size='10pt')
+        for axis in ('bottom', 'left'):
+            ax = pi.getAxis(axis)
+            ax.setPen(pg.mkPen(BORDER))
+            ax.setTextPen(pg.mkPen(SUBTEXT))
+            # Paper mode drops the sub-minor grid, which prints as noise.
+            ax.setStyle(maxTickLevel=TICK_LEVEL)
+
+        fill = QColor(BLUE)
+        fill.setAlpha(32)
+        self._curve.setPen(pg.mkPen(BLUE, width=PLOT_LW))
+        self._curve.setBrush(pg.mkBrush(fill))
+        self._dots.setPen(pg.mkPen(MARKER_EDGE, width=1.0))
+        self._dots.setBrush(pg.mkBrush(YELLOW))
+        self._vline.setPen(pg.mkPen(MUTED, width=1, style=Qt.DashLine))
+
+        box = QColor(SURFACE)
+        box.setAlpha(235)
+        self._readout.fill = pg.mkBrush(box)
+        self._readout.border = pg.mkPen(PANEL)
+        self._readout.setColor(TEXT)
+        for t in self._labels:
+            t.setColor(YELLOW)
+
     def setData(self, ratios, values, minima_x, minima_y, xmax):
         self._x, self._y = ratios, values
+        self._mx, self._my = minima_x, minima_y
         self._curve.setData(ratios, values)
+        self._rebuild_labels()
+        self.setViewRatioRange(xmax)
+
+    def _rebuild_labels(self):
+        pi = self.getPlotItem()
         for item in self._labels:
-            self.getPlotItem().removeItem(item)
+            pi.removeItem(item)
         self._labels.clear()
-
-        if len(minima_x):
-            self._dots.setData(minima_x, minima_y)
-            for x, y in zip(minima_x, minima_y):
-                t = pg.TextItem(f"{ratio_to_interval_name(x)}\n{x:.3f}",
-                                anchor=(0.5, 0.0), color=YELLOW)
-                t.setFont(QFont("Segoe UI", 7))
-                t.setPos(x, y - 0.012)
-                self.getPlotItem().addItem(t, ignoreBounds=True)
-                self._labels.append(t)
-        else:
+        if self._mx is None or not len(self._mx):
             self._dots.setData([], [])
+            return
+        self._dots.setData(self._mx, self._my)
+        for x, y in zip(self._mx, self._my):
+            t = pg.TextItem(f"{ratio_to_interval_name(x)}\n{x:.3f}",
+                            anchor=(0.5, 0.0), color=YELLOW)
+            t.setFont(QFont("Segoe UI", 7))
+            t.setPos(x, y - 0.012)
+            pi.addItem(t, ignoreBounds=True)
+            self._labels.append(t)
 
+    def setViewRatioRange(self, xmax):
+        """Zoom to ratios 0.9..xmax and rescale y to what's actually visible."""
+        self._xmax = xmax
+        if self._x is None or not len(self._x):
+            return
         self.setXRange(0.9, xmax, padding=0.01)
-        self.setYRange(0, float(np.max(values)) * 1.08, padding=0)
+        visible = self._y[self._x <= xmax]
+        top = float(np.max(visible)) if len(visible) else float(np.max(self._y))
+        self.setYRange(0, top * 1.08, padding=0)
+        if self._mx is not None and len(self._mx) == len(self._labels):
+            for x, t in zip(self._mx, self._labels):
+                t.setVisible(bool(x <= xmax))
 
     def _nearest(self, x):
         if self._x is None or not len(self._x):
@@ -983,6 +1153,90 @@ class CurveView(pg.PlotWidget):
         p = vb.mapSceneToView(ev.scenePos())
         self.picked.emit(float(p.x()))
 
+    def hideCrosshair(self):
+        self._vline.setVisible(False)
+        self._readout.setVisible(False)
+
+
+class OvertoneView(pg.PlotWidget):
+    """Partials of the last sound on one log-frequency axis; partials of
+    different voices that coincide get a ring."""
+
+    MATCH_CENTS = 5.0
+    WIDTHS = (6.0, 3.5, 1.8)          # nested so coinciding stems stay visible
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        pi = self.getPlotItem()
+        pi.setMenuEnabled(False)
+        pi.hideButtons()
+        pi.setMouseEnabled(False, False)
+        pi.hideAxis('left')
+        pi.layout.setContentsMargins(4, 2, 10, 0)
+        self._voices = None
+        self._ref = None
+        self.apply_palette()
+
+    def apply_palette(self):
+        self.setBackground(MANTLE)
+        ax = self.getPlotItem().getAxis('bottom')
+        ax.setPen(pg.mkPen(BORDER))
+        ax.setTextPen(pg.mkPen(SUBTEXT))
+        if self._voices is not None:
+            self.setVoices(self._voices, self._ref)
+
+    def setVoices(self, voices, ref_freq):
+        """*voices*: list of (letter, spectrum, ratio). Returns the number of shared partials."""
+        self._voices, self._ref = voices, ref_freq
+        pi = self.getPlotItem()
+        pi.clear()
+        parts = []
+        for letter, spec, ratio in voices:
+            f = ref_freq * ratio * np.asarray(spec["freq"], dtype=float)
+            a = np.abs(np.asarray(spec["amp"], dtype=float))
+            a = a / a.max() if a.size and a.max() > 0 else a
+            parts.append((letter, f, a))
+        if not parts:
+            return 0
+
+        def lx(f):
+            return np.log2(np.asarray(f) / ref_freq)
+
+        matches = 0
+        for i in range(len(parts)):
+            for j in range(i + 1, len(parts)):
+                fi, ai = parts[i][1], parts[i][2]
+                fj, aj = parts[j][1], parts[j][2]
+                F1, F2 = (g.ravel() for g in np.meshgrid(fi, fj, indexing='ij'))
+                A1, A2 = (g.ravel() for g in np.meshgrid(ai, aj, indexing='ij'))
+                cents = 1200 * np.abs(np.log2(F2 / F1))
+                low = np.minimum(A1, A2)
+                for k in np.nonzero((cents < self.MATCH_CENTS) & (low > 0.02))[0]:
+                    pi.addItem(pg.ScatterPlotItem(
+                        x=[float(lx(F1[k]))], y=[max(A1[k], A2[k]) + 0.12], size=9,
+                        symbol='o', pen=pg.mkPen(TEXT, width=1.4), brush=pg.mkBrush(0, 0, 0, 0)))
+                    matches += 1
+
+        for k, (letter, f, a) in enumerate(parts):
+            color = QColor(VOICE_COLORS[letter])
+            color.setAlpha(200)
+            x = np.repeat(lx(f), 2)
+            y = np.column_stack([np.zeros_like(a), a]).ravel()
+            pi.plot(x, y, connect='pairs',
+                    pen=pg.mkPen(color, width=self.WIDTHS[min(k, 2)]))
+
+        all_x = np.concatenate([lx(f) for _, f, _ in parts])
+        lo, hi = float(all_x.min()), float(all_x.max())
+        pad = max(0.08, 0.04 * (hi - lo))
+        pi.setXRange(lo - pad, hi + pad, padding=0)
+        pi.setYRange(0, 1.25, padding=0)
+        octaves = range(int(np.floor(lo - pad)), int(np.ceil(hi + pad)) + 1)
+        pi.getAxis('bottom').setTicks([
+            [(n, f"{ref_freq * 2 ** n:.0f} Hz") for n in octaves],
+            [(n + np.log2(h), "") for n in octaves for h in (1.25, 1.5, 1.75)],
+        ])
+        return matches
+
 
 class HeatmapView(pg.PlotWidget):
     """Triad space as an image with iso-contours."""
@@ -991,14 +1245,7 @@ class HeatmapView(pg.PlotWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground(MANTLE)
         pi = self.getPlotItem()
-        pi.setLabel('bottom', 'voice B ratio', color=SUBTEXT, size='10pt')
-        pi.setLabel('left', 'voice C ratio', color=SUBTEXT, size='10pt')
-        for axis in ('bottom', 'left'):
-            ax = pi.getAxis(axis)
-            ax.setPen(pg.mkPen(BORDER))
-            ax.setTextPen(pg.mkPen(SUBTEXT))
         pi.setMenuEnabled(False)
         pi.setAspectLocked(True)
 
@@ -1008,19 +1255,39 @@ class HeatmapView(pg.PlotWidget):
         pi.addItem(self.img)
 
         self.bar = pg.ColorBarItem(colorMap=self.cmap, interactive=False,
-                                   label='dissonance', width=12)
+                                   label='Sensory dissonance', width=12)
         self.bar.setImageItem(self.img, insert_in=pi)
-        self.bar.axis.setPen(pg.mkPen(BORDER))
-        self.bar.axis.setTextPen(pg.mkPen(SUBTEXT))
 
         self._iso = []
+        # Overlay stays white in both themes: minima sit in the dark end of the
+        # colour map, so white reads better than the theme's text colour.
         self._dots = pg.ScatterPlotItem(size=12, pen=pg.mkPen('#ffffff', width=1.4),
                                         brush=pg.mkBrush(YELLOW))
         pi.addItem(self._dots)
         self._labels = []
         self._x = self._y = self._z = None
 
+        self.apply_palette()
         self.scene().sigMouseClicked.connect(self._on_click)
+
+    def apply_palette(self):
+        self.setBackground(MANTLE)
+        pi = self.getPlotItem()
+        pi.setLabel('bottom', 'Voice B ratio  (B / A)', color=SUBTEXT, size='10pt')
+        pi.setLabel('left', 'Voice C ratio  (C / A)', color=SUBTEXT, size='10pt')
+        for axis in ('bottom', 'left'):
+            ax = pi.getAxis(axis)
+            ax.setPen(pg.mkPen(BORDER))
+            ax.setTextPen(pg.mkPen(SUBTEXT))
+        self.bar.axis.setPen(pg.mkPen(BORDER))
+        self.bar.axis.setTextPen(pg.mkPen(SUBTEXT))
+        # ColorBarItem puts its tick values on one axis and the caption on the
+        # opposite one, so the caption has to be recoloured separately.
+        self.bar.getAxis('left').setLabel('Sensory dissonance', color=SUBTEXT)
+        self.cmap = _magma()
+        self.img.setColorMap(self.cmap)
+        self.bar.setColorMap(self.cmap)
+        self._dots.setBrush(pg.mkBrush(YELLOW))
 
     def setData(self, x, y, z, tri_x, tri_y, tri_z):
         self._x, self._y, self._z = x, y, z
@@ -1051,7 +1318,8 @@ class HeatmapView(pg.PlotWidget):
         if len(tri_x):
             self._dots.setData(tri_x, tri_y)
             for bx, cy in zip(tri_x, tri_y):
-                t = pg.TextItem(f"{bx:.2f} \u00b7 {cy:.2f}", anchor=(0, 1), color='w')
+                t = pg.TextItem(f"{bx:.2f} \u00b7 {cy:.2f}", anchor=(0, 1),
+                                color='#ffffff', fill=pg.mkBrush(0, 0, 0, 130))
                 t.setFont(QFont("Segoe UI", 7, QFont.Bold))
                 t.setPos(bx, cy)
                 pi.addItem(t, ignoreBounds=True)
@@ -1075,15 +1343,26 @@ class HeatmapView(pg.PlotWidget):
 
 
 def _magma():
-    try:
-        return pg.colormap.getFromMatplotlib('magma')
-    except Exception:
-        return pg.colormap.get('CET-L8')
+    # Name comes from the active palette; pyqtgraph bundles magma and viridis.
+    for name in (CMAP, 'magma', 'CET-L8', 'CET-L16'):
+        try:
+            cmap = pg.colormap.get(name)
+        except Exception:
+            continue
+        if cmap is not None:
+            return cmap
+    raise RuntimeError('pyqtgraph has no usable colormap installed')
 
 
 if HAS_GL:
 
     from OpenGL import GL as _GL
+    from PySide6 import QtOpenGL
+
+    SURFACE_CAMERA = dict(distance=4.2, elevation=40.0, azimuth=68.0)
+    # On-screen only: the look-at offset a middle-button drag would give, as
+    # (right, down) in world units. Exports set their own centre and crop.
+    SURFACE_PAN = (-0.08, 0.3)
 
     # Markers are drawn without depth testing so a consonant valley stays
     # visible even when a taller ridge sits between it and the camera.
@@ -1104,15 +1383,14 @@ if HAS_GL:
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setBackgroundColor(QColor(MANTLE))
-            self.setCameraPosition(distance=4.6, elevation=25, azimuth=69)
+            self.setCameraPosition(**SURFACE_CAMERA)
             self.opts['fov'] = 50
+            self._default_pan()
 
-            grid = gl.GLGridItem()
-            grid.setSize(2.0, 2.0)
-            grid.setSpacing(0.2, 0.2)
-            grid.setColor(QColor(69, 71, 90, 110))
-            self.addItem(grid)
+            self._grid = gl.GLGridItem()
+            self._grid.setSize(2.0, 2.0)
+            self._grid.setSpacing(0.2, 0.2)
+            self.addItem(self._grid)
 
             self._surface = None
             self._dots = None
@@ -1121,6 +1399,17 @@ if HAS_GL:
             self._x = self._y = self._z = None
             self._zs = None
             self._cmap = _magma()
+            self.apply_palette()
+
+        def apply_palette(self):
+            """Background/grid/colormap only; call setData again to recolour."""
+            self.setBackgroundColor(QColor(MANTLE))
+            g = QColor(BORDER)
+            g.setAlpha(110)
+            self._grid.setColor(g)
+            self._cmap = _magma()
+            for t in self._text:
+                t.setData(color=QColor(SUBTEXT))
 
         # ── data ───────────────────────────────────────────────────────────
 
@@ -1288,7 +1577,19 @@ if HAS_GL:
                 float(np.clip(gy[i], self._y[0], self._y[-1]))
 
         def resetView(self):
-            self.setCameraPosition(distance=4.6, elevation=25, azimuth=69)
+            self.setCameraPosition(**SURFACE_CAMERA)
+            self._default_pan()
+
+        def _default_pan(self):
+            # Same basis GLViewWidget.pan(..., relative='view-upright') uses for middle-drag.
+            self.opts['center'] = pg.Vector(0, 0, 0)
+            look = self.opts['center'] - self.cameraPosition()
+            up = pg.Vector(0, 0, 1)
+            right = pg.Vector(QVector3D.crossProduct(up, look).normalized())
+            down = pg.Vector(QVector3D.crossProduct(right, up).normalized())
+            dx, dy = SURFACE_PAN
+            self.opts['center'] = self.opts['center'] + right * dx + down * dy
+            self.update()
 
 else:  # pragma: no cover - fallback when OpenGL is unavailable
 
@@ -1302,6 +1603,9 @@ else:  # pragma: no cover - fallback when OpenGL is unavailable
             self.setObjectName("emptyText")
 
         def setData(self, *args, **kwargs):
+            pass
+
+        def apply_palette(self):
             pass
 
         def resetView(self):
@@ -1318,23 +1622,24 @@ class ComputeWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, spec_a, spec_b, spec_c, ref_freq, max_interval,
-                 step_2d, step_3d, parent=None):
+                 step_2d, step_3d, max_2d, parent=None):
         super().__init__(parent)
         self.args = (spec_a, spec_b, spec_c, ref_freq, max_interval,
-                     step_2d, step_3d)
+                     step_2d, step_3d, max(max_2d, max_interval))
 
     def run(self):
-        spec_a, spec_b, spec_c, ref_freq, max_interval, step_2d, step_3d = self.args
+        (spec_a, spec_b, spec_c, ref_freq, max_interval,
+         step_2d, step_3d, max_2d) = self.args
         try:
             ratios_2d, diss_2d = compute_dissonance_2d(
-                spec_a, spec_b, ref_freq, max_interval, step_2d)
+                spec_a, spec_b, ref_freq, max_2d, step_2d)
             minima_x, minima_y = find_minima(ratios_2d, diss_2d)
 
             x3, y3, z3 = compute_dissonance_3d(
                 spec_a, spec_b, spec_c, ref_freq, max_interval, step_3d,
                 progress_callback=lambda p: self.progress.emit(int(p * 100)))
 
-            tx, ty, tz = find_minima_3d(x3, y3, z3)
+            tx, ty, tz = find_minima_3d(x3, y3, z3, top_n=None)
         except Exception as exc:  # surfaced in the status bar
             self.failed.emit(str(exc))
             return
@@ -1344,7 +1649,1022 @@ class ComputeWorker(QThread):
             "minima_x": minima_x, "minima_y": minima_y,
             "x_3d": x3, "y_3d": y3, "z_3d": z3,
             "tri_x": tx, "tri_y": ty, "tri_z": tz,
+            "max_interval": max_interval,
         })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Figure export
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Figure editor  (publication figures)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SCREEN_DPI = 96.0
+FIG_FONTS = [("Serif \u2014 Times New Roman", "Times New Roman"),
+             ("Sans \u2014 Arial", "Arial"),
+             ("Sans \u2014 Calibri", "Calibri")]
+FIG_CMAPS = [("Viridis", "viridis"), ("Cividis", "cividis"), ("Magma", "magma"),
+             ("Inferno", "inferno"), ("Greyscale", "CET-L1")]
+FIG_FORMATS = [("PDF \u2014 vector", "pdf", "PDF document (*.pdf)"),
+               ("SVG \u2014 vector", "svg", "SVG vector (*.svg)"),
+               ("PNG \u2014 raster", "png", "PNG image (*.png)")]
+FIG_LABEL_MODES = ["None", "Ratio", "Interval name", "Both"]
+
+FIGURE_COMMON = dict(
+    font="Times New Roman", size=9.0, line=1.0, axis=0.8, ticks_in=True,
+    frame=True, grid=False, fill=False, markers=True, cmap="viridis",
+    contours=True, square=False, dpi=600, fmt="pdf", xmin=0.9, xmax=2.3, ymax=0.0,
+)
+FIGURE_DEFAULTS = {
+    "curve": dict(title="", xlabel="Frequency ratio",
+                  ylabel="Sensory dissonance (normalized)", cbar="",
+                  labels="Ratio", width=6.0, height=3.5),
+    "heatmap": dict(title="", xlabel="Voice B frequency ratio",
+                    ylabel="Voice C frequency ratio",
+                    cbar="Sensory dissonance (normalized)",
+                    labels="None", width=4.8, height=4.0),
+}
+
+
+def _figure_label(x, mode):
+    name = ratio_to_interval_name(x)
+    return {"Ratio": f"{x:.3f}", "Interval name": name}.get(mode, f"{name}\n{x:.3f}")
+
+
+def _pad_axis_label(ax, gap):
+    """Clear the axis title from the tick numbers; pyqtgraph reserves only 80 % of it."""
+    def width():
+        pg.AxisItem._updateWidth(ax)
+        if ax.fixedWidth is None and ax.label.isVisible() and ax.style["showValues"]:
+            w = ax.maximumWidth() + 0.2 * ax.label.boundingRect().height() + gap
+            ax.setMaximumWidth(w)
+            ax.setMinimumWidth(w)
+
+    def height():
+        pg.AxisItem._updateHeight(ax)
+        if ax.fixedHeight is None and ax.label.isVisible() and ax.style["showValues"]:
+            h = ax.maximumHeight() + 0.2 * ax.label.boundingRect().height() + gap
+            ax.setMaximumHeight(h)
+            ax.setMinimumHeight(h)
+
+    ax._updateWidth = width
+    ax._updateHeight = height
+
+
+def make_figure(kind, data, st, ppi):
+    """Build a white print-styled plot, st['width'] x st['height'] inches at *ppi*.
+
+    All sizes are given in points and converted here, because pyqtgraph pens are
+    cosmetic: scaling a finished render up would thicken the text but not the lines.
+    """
+    pt = ppi / 72.0
+    fam = st["font"]
+    black = "#000000"
+
+    def font(scale=1.0):
+        f = QFont(fam)
+        f.setPixelSize(max(1, round(st["size"] * scale * pt)))
+        return f
+
+    css = {"color": black, "font-size": f"{max(1, round(st['size'] * pt))}px",
+           "font-family": fam}
+    axis_pen = pg.mkPen(black, width=st["axis"] * pt)
+    tick_len = round(3.5 * pt) * (-1 if st["ticks_in"] else 1)
+
+    def style_axis(ax, values=True):
+        ax.setPen(axis_pen)
+        ax.setTextPen(pg.mkPen(black))
+        ax.setTickFont(font())
+        ax.setStyle(tickLength=tick_len, tickTextOffset=round(2.5 * pt),
+                    showValues=values, maxTickLevel=1)
+        _pad_axis_label(ax, round(3 * pt))
+
+    w = pg.PlotWidget(background="w")
+    w.setFixedSize(round(st["width"] * ppi), round(st["height"] * ppi))
+    w.setAntialiasing(True)
+    w._keep = []
+    pi = w.getPlotItem()
+    pi.hideButtons()
+    pi.setMenuEnabled(False)
+    pi.setMouseEnabled(False, False)
+    m = round(5 * pt)
+    pi.layout.setContentsMargins(m, m, m, m)
+
+    for name in ("left", "bottom", "top", "right"):
+        if name in ("top", "right"):
+            if not st["frame"]:
+                pi.hideAxis(name)
+                continue
+            pi.showAxis(name)
+        ax = pi.getAxis(name)
+        style_axis(ax, values=name in ("left", "bottom"))
+        ax.setGrid(int(0.2 * 255) if st["grid"] and name in ("left", "bottom") else False)
+
+    for name, key in (("bottom", "xlabel"), ("left", "ylabel")):
+        if st[key].strip():
+            pi.setLabel(name, st[key], **css)
+        else:
+            pi.getAxis(name).showLabel(False)
+    if st["title"].strip():
+        tpx = max(1, round(st["size"] * 1.15 * pt))
+        pi.setTitle(f"<span style='font-family:{fam}'>{st['title']}</span>",
+                    color=black, size=f"{tpx}px")
+        # pyqtgraph pins the title row at 30 px regardless of font size.
+        pi.titleLabel.setMaximumHeight(tpx * 1.8)
+        pi.layout.setRowFixedHeight(0, tpx * 1.8)
+
+    if kind == "curve":
+        r, d = data["ratios_2d"], data["diss_2d"]
+        x0, x1 = st["xmin"], st["xmax"]
+        vis = (r >= x0) & (r <= x1)
+        top = st["ymax"] if st["ymax"] > 0 else (
+            float(d[vis].max()) * 1.05 if vis.any() else 1.0)
+        extra = dict(fillLevel=0.0, brush=pg.mkBrush(0, 0, 0, 30)) if st["fill"] else {}
+        pi.plot(r, d, pen=pg.mkPen(black, width=st["line"] * pt), **extra)
+
+        mx, my = data["minima_x"], data["minima_y"]
+        keep = (mx >= x0) & (mx <= x1)
+        mx, my = mx[keep], my[keep]
+        if st["markers"] and len(mx):
+            pi.addItem(pg.ScatterPlotItem(x=mx, y=my, size=4.5 * pt,
+                                          pen=pg.mkPen(black, width=0.5 * pt),
+                                          brush=pg.mkBrush("#d55e00")))
+        if st["labels"] != "None":
+            for x, y in zip(mx, my):
+                # Labels under a minimum near zero would fall off the axis.
+                low = y < 0.15 * top
+                t = pg.TextItem(_figure_label(x, st["labels"]), color=black,
+                                anchor=(0.5, 1.2) if low else (0.5, -0.15),
+                                fill=pg.mkBrush(255, 255, 255, 220) if low else None)
+                t.setFont(font(0.8))
+                t.setPos(x, y)
+                pi.addItem(t, ignoreBounds=True)
+        pi.setXRange(x0, x1, padding=0)
+        pi.setYRange(0, top, padding=0)
+        return w
+
+    x, y, z = data["x_3d"], data["y_3d"], data["z_3d"]
+    lo, hi = float(z.min()), float(z.max())
+    cmap = pg.colormap.get(st["cmap"])
+    img = SmoothImageItem()
+    img.setImage(z, autoLevels=False)
+    img.setLevels((lo, hi))
+    img.setColorMap(cmap)
+    img.setRect(QRectF(x[0], y[0], x[-1] - x[0], y[-1] - y[0]))
+    pi.addItem(img)
+    if st["contours"]:
+        smooth = pg.gaussianFilter(z, (1.6, 1.6))
+        for frac in np.linspace(0.12, 0.9, 7):
+            iso = pg.IsocurveItem(data=smooth, level=lo + (hi - lo) * frac,
+                                  pen=pg.mkPen(255, 255, 255, 110, width=0.4 * pt))
+            iso.setParentItem(img)
+            iso.setZValue(5)
+            w._keep.append(iso)
+
+    tx, ty = data["tri_vis"][0], data["tri_vis"][1]
+    if st["markers"] and len(tx):
+        pi.addItem(pg.ScatterPlotItem(x=tx, y=ty, size=5 * pt,
+                                      pen=pg.mkPen(black, width=0.5 * pt),
+                                      brush=pg.mkBrush("#ffffff")))
+    if st["labels"] != "None":
+        for bx, cy in zip(tx, ty):
+            if st["labels"] == "Ratio":
+                text = f"{bx:.3f} : {cy:.3f}"
+            else:
+                text = f"{ratio_to_interval_name(bx)} \u00b7 {ratio_to_interval_name(cy)}"
+                if st["labels"] == "Both":
+                    text += f"\n{bx:.3f} : {cy:.3f}"
+            t = pg.TextItem(text, color=black, anchor=(-0.08, 1.08),
+                            fill=pg.mkBrush(255, 255, 255, 210))
+            t.setFont(font(0.75))
+            t.setPos(bx, cy)
+            pi.addItem(t, ignoreBounds=True)
+
+    bar = pg.ColorBarItem(colorMap=cmap, values=(lo, hi), interactive=False,
+                          width=max(4, round(9 * pt)))
+    bar.setImageItem(img, insert_in=pi)
+    for name in ("left", "top", "bottom"):
+        bar.getAxis(name).setPen(axis_pen)
+    style_axis(bar.axis)
+    bar.axis.setWidth(None)
+    if st["cbar"].strip():
+        bar.axis.setLabel(st["cbar"], **css)
+    w._keep.append(bar)
+
+    pi.setAspectLocked(st["square"])
+    pi.setXRange(x[0], x[-1], padding=0)
+    pi.setYRange(y[0], y[-1], padding=0)
+    return w
+
+
+def render_figure(kind, data, st, path):
+    """Rebuild the figure natively at output resolution and write it to *path*."""
+    fmt = st["fmt"]
+    # Vector output is resolution-free; 96 keeps 1 px = 1/96 in so points stay exact.
+    ppi = float(st["dpi"]) if fmt == "png" else SCREEN_DPI
+    fig = make_figure(kind, data, st, ppi)
+    fig.setAttribute(Qt.WA_DontShowOnScreen, True)
+    fig.show()
+    # Axes only grow to fit their tick text after a first paint, so paint twice.
+    for _ in range(2):
+        QApplication.processEvents()
+        fig.grab()
+    QApplication.processEvents()
+    try:
+        src = fig.viewport().rect()
+        rect = QRectF(0, 0, src.width(), src.height())
+
+        def paint(p):
+            p.fillRect(rect, QColor("#ffffff"))
+            fig.render(p, rect, src)
+
+        _write_device(path, fmt, src.width(), src.height(), ppi, st, paint)
+    finally:
+        fig.close()
+        fig.deleteLater()
+
+
+def _write_device(path, fmt, w, h, ppi, st, paint):
+    """Run *paint(painter)* on a w x h px canvas at *ppi* and save it as *fmt*."""
+    def run(device):
+        p = QPainter(device)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            paint(p)
+        finally:
+            p.end()
+
+    if fmt == "png":
+        image = QImage(w, h, QImage.Format_ARGB32)
+        image.fill(QColor("#ffffff"))
+        run(image)
+        # DPI metadata only after painting: pyqtgraph axes lay out against the device DPI.
+        dpm = round(ppi / 0.0254)
+        image.setDotsPerMeterX(dpm)
+        image.setDotsPerMeterY(dpm)
+        if not image.save(str(path)):
+            raise RuntimeError("Qt could not write the PNG")
+    elif fmt == "svg":
+        gen = QSvgGenerator()
+        gen.setFileName(str(path))
+        gen.setSize(QSize(w, h))
+        gen.setViewBox(QRectF(0, 0, w, h))
+        gen.setResolution(int(ppi))
+        gen.setTitle("Dissonance Explorer figure")
+        run(gen)
+    elif fmt == "pdf":
+        writer = QPdfWriter(str(path))
+        writer.setResolution(int(ppi))
+        writer.setPageSize(QPageSize(QSizeF(st["width"], st["height"]),
+                                     QPageSize.Unit.Inch))
+        writer.setPageMargins(QMarginsF(0, 0, 0, 0))
+        run(writer)
+    else:
+        raise RuntimeError(f"unknown figure format {fmt!r}")
+
+
+class FigureEditor(QDialog):
+    """Live, true-size preview of a paper figure with editable text and style."""
+
+    def __init__(self, kind, data, state, parent=None):
+        super().__init__(parent)
+        self.kind, self.data = kind, data
+        self.state = dict(state)
+        self.saved_path = None
+        self.setWindowTitle(f"Figure editor \u2014 {kind}")
+        avail = self.screen().availableGeometry()
+        self.resize(min(1200, avail.width() - 60), min(760, avail.height() - 60))
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        self.canvas = QScrollArea()
+        self.canvas.setAlignment(Qt.AlignCenter)
+        self.canvas.setStyleSheet("QScrollArea { background: #8a8a8a; border-radius: 8px; }")
+        left.addWidget(self.canvas, 1)
+        self.msg = QLabel()
+        self.msg.setObjectName("hint")
+        left.addWidget(self.msg)
+        root.addLayout(left, 1)
+
+        side = QWidget()
+        form = QFormLayout(side)
+        form.setContentsMargins(0, 0, 6, 0)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(5)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(side)
+        scroll.setFixedWidth(330)
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        right.addWidget(scroll, 1)
+        root.addLayout(right, 0)
+
+        def section(text):
+            lbl = QLabel(text)
+            lbl.setObjectName("cardTitle")
+            lbl.setContentsMargins(0, 8, 0, 0)
+            form.addRow(lbl)
+
+        self._widgets = {}
+        self._build_form(form, section)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        save = QPushButton("Save\u2026")
+        save.setObjectName("primary")
+        save.setCursor(Qt.PointingHandCursor)
+        save.clicked.connect(self._save)
+        close = QPushButton("Close")
+        close.setCursor(Qt.PointingHandCursor)
+        close.clicked.connect(self.accept)
+        buttons.addWidget(save, 1)
+        buttons.addWidget(close, 0)
+        right.addLayout(buttons)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self._rebuild)
+        self._rebuild()
+
+    def _build_form(self, form, section):
+        curve = self.kind == "curve"
+        section("TEXT")
+        form.addRow("Title", self._line("title"))
+        form.addRow("X axis", self._line("xlabel"))
+        form.addRow("Y axis", self._line("ylabel"))
+        if not curve:
+            form.addRow("Colour bar", self._line("cbar"))
+        self._rich_text_tip(form)
+
+        section("STYLE")
+        form.addRow("Font", self._combo("font", FIG_FONTS))
+        form.addRow("Font size (pt)", self._num("size", 5, 24, 0.5, 1))
+        if curve:
+            form.addRow("Line (pt)", self._num("line", 0.1, 6, 0.1, 2))
+        form.addRow("Axes (pt)", self._num("axis", 0.1, 4, 0.1, 2))
+        form.addRow("Ticks", self._combo("ticks_in", [("Inside", True), ("Outside", False)]))
+        form.addRow(self._check("frame", "Box frame (top and right axes)"))
+        form.addRow(self._check("grid", "Grid lines"))
+        if curve:
+            form.addRow(self._check("fill", "Shade under curve"))
+            form.addRow(self._check("markers", "Mark minima"))
+            form.addRow("Minima labels", self._combo(
+                "labels", [(m, m) for m in FIG_LABEL_MODES]))
+        else:
+            form.addRow("Colour map", self._combo("cmap", FIG_CMAPS))
+            form.addRow(self._check("contours", "Contour lines"))
+            form.addRow(self._check("square", "Equal axis scaling"))
+            form.addRow(self._check("markers", "Mark best triads"))
+            form.addRow("Triad labels", self._combo(
+                "labels", [(m, m) for m in FIG_LABEL_MODES]))
+
+        if curve:
+            section("RANGE")
+            top = float(self.data["ratios_2d"][-1])
+            form.addRow("X from", self._num("xmin", 0.5, top, 0.05, 3))
+            form.addRow("X to", self._num("xmax", 0.5, top, 0.05, 3))
+            form.addRow("Y max (0 = auto)", self._num("ymax", 0, 2, 0.05, 3))
+
+        self._output_rows(form, section, "PNG resolution (dpi)")
+
+    def _rich_text_tip(self, form):
+        tip = QLabel("Rich text works: <i>…</i>, <sub>…</sub>, <sup>…</sup>")
+        tip.setObjectName("hint")
+        tip.setTextFormat(Qt.PlainText)
+        form.addRow(tip)
+
+    def _output_rows(self, form, section, dpi_label):
+        section("OUTPUT")
+        form.addRow("Width (in)", self._num("width", 1, 14, 0.1, 2))
+        form.addRow("Height (in)", self._num("height", 1, 14, 0.1, 2))
+        form.addRow("Format", self._combo("fmt", [(f[0], f[1]) for f in FIG_FORMATS]))
+        form.addRow(dpi_label, self._num("dpi", 72, 1200, 50, 0))
+        sizes = QLabel("Single column \u2248 3.5 in, double column \u2248 7 in")
+        sizes.setObjectName("hint")
+        form.addRow(sizes)
+
+    # ── control factories ─────────────────────────────────────────────────
+
+    def _set(self, key, value):
+        self.state[key] = value
+        self._timer.start()
+
+    def _line(self, key):
+        e = QLineEdit(self.state[key])
+        e.textChanged.connect(lambda v: self._set(key, v))
+        return e
+
+    def _num(self, key, lo, hi, step, decimals):
+        s = QDoubleSpinBox()
+        s.setRange(lo, hi)
+        s.setDecimals(decimals)
+        s.setSingleStep(step)
+        s.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        s.setValue(float(self.state[key]))
+        s.valueChanged.connect(lambda v: self._set(key, v))
+        self._widgets[key] = s
+        return s
+
+    def _check(self, key, text):
+        c = QCheckBox(text)
+        c.setChecked(bool(self.state[key]))
+        c.toggled.connect(lambda v: self._set(key, v))
+        return c
+
+    def _combo(self, key, items):
+        c = QComboBox()
+        for label, value in items:
+            c.addItem(label, value)
+        c.setCurrentIndex(max(0, c.findData(self.state[key])))
+        c.currentIndexChanged.connect(lambda _: self._set(key, c.currentData()))
+        return c
+
+    # ── preview / save ────────────────────────────────────────────────────
+
+    def _valid(self):
+        if self.kind == "curve" and self.state["xmin"] >= self.state["xmax"]:
+            self.msg.setText("X from must be less than X to")
+            return False
+        return True
+
+    def _rebuild(self):
+        if not self._valid():
+            return
+        fig = make_figure(self.kind, self.data, self.state, SCREEN_DPI)
+        old = self.canvas.takeWidget()
+        if old is not None:
+            old.deleteLater()
+        self.canvas.setWidget(fig)
+        self.msg.setText(f"Actual size preview \u00b7 {self.state['width']:g} \u00d7 "
+                         f"{self.state['height']:g} in")
+
+    def _save(self):
+        if not self._valid():
+            return
+        fmt = self.state["fmt"]
+        filt = next(f[2] for f in FIG_FORMATS if f[1] == fmt)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save figure", f"dissonance_{self.kind}.{fmt}", filt)
+        if not path:
+            return
+        if not path.lower().endswith("." + fmt):
+            path += "." + fmt
+        try:
+            self._write(path)
+        except Exception as exc:
+            self.msg.setText(f"Save failed: {exc}")
+            return
+        self.saved_path = path
+        self.msg.setText(f"Saved {Path(path).name}")
+
+    def _write(self, path):
+        render_figure(self.kind, self.data, self.state, path)
+
+
+SURFACE_DEFAULTS = dict(
+    title="", xlabel="Voice B ratio", ylabel="Voice C ratio",
+    zlabel="Sensory dissonance", cbar="Sensory dissonance (normalized)",
+    font="Times New Roman", size=9.0, axis=0.8, cmap="viridis", shading=True,
+    floor=True, zaxis=True, colorbar=True, markers=True, labels="None",
+    zscale=1.1, azimuth=68.0, elevation=40.0, distance=4.2,
+    width=6.0, height=4.5, dpi=600, fmt="pdf",
+)
+SURFACE_CAMERA_KEYS = ("azimuth", "elevation", "distance")
+
+
+def _nice_ticks(lo, hi, target=5):
+    span = max(hi - lo, 1e-12)
+    mag = 10 ** np.floor(np.log10(span / target))
+    for m in (1, 2, 2.5, 5, 10):
+        step = m * mag
+        if span / step <= target + 1:
+            break
+    start = np.ceil(lo / step - 1e-9) * step
+    return [round(v, 6) for v in np.arange(start, hi + step * 1e-6, step)]
+
+
+def _html_doc(html, font):
+    doc = QTextDocument()
+    doc.setDocumentMargin(0)
+    doc.setDefaultFont(font)
+    doc.setHtml(f"<span style='color:#000000'>{html}</span>")
+    return doc
+
+
+def _text_at(p, html, font, cx, cy, angle=0.0):
+    """Draw rich text centred on (cx, cy), optionally rotated; returns its size."""
+    doc = _html_doc(html, font)
+    size = doc.size()
+    p.save()
+    p.translate(cx, cy)
+    p.rotate(angle)
+    p.translate(-size.width() / 2, -size.height() / 2)
+    doc.drawContents(p)
+    p.restore()
+    return size
+
+
+class SurfaceRenderer:
+    """Offscreen GL scene for print: raster surface, vector annotations on top.
+
+    GL text is painted straight onto the widget and never reaches an offscreen
+    render, so every label is drawn afterwards with QPainter.
+    """
+
+    STEPS = 220
+
+    def __init__(self, data):
+        self.data = data
+        self.view = gl.GLViewWidget()
+        self.view.setAttribute(Qt.WA_DontShowOnScreen, True)
+        self.view.resize(320, 240)
+        self.view.show()
+        QApplication.processEvents()
+        self.view.setBackgroundColor(QColor("#ffffff"))
+        # Wider than the on-screen 50 deg so the whole surface is always in frame; a
+        # field-of-view change only scales the image, and it's cropped to fit anyway.
+        self.view.opts['fov'] = 90
+        self._key = None
+        self._items = []
+        self._snap = (None, None)
+        self._ink = {}
+
+    def close(self):
+        self.view.close()
+        self.view.deleteLater()
+
+    @staticmethod
+    def unit(values, axis):
+        lo, hi = axis[0], axis[-1]
+        return (np.asarray(values, dtype=float) - lo) / max(hi - lo, 1e-12) * 2.0 - 1.0
+
+    def _sync(self, st):
+        key = (st["cmap"], st["shading"], st["floor"], round(st["zscale"], 4))
+        if key != self._key:
+            self._key = key
+            for item in self._items:
+                self.view.removeItem(item)
+            self._items = []
+            x, y, z = self.data["x_3d"], self.data["y_3d"], self.data["z_3d"]
+            step = max(1, len(x) // self.STEPS)
+            xs, ys = x[::step], y[::step]
+            zs = np.ascontiguousarray(z[::step, ::step], dtype=np.float32)
+            lo, hi = float(z.min()), float(z.max())
+            colors = pg.colormap.get(st["cmap"]).map(
+                (zs - lo) / max(hi - lo, 1e-9), mode='float')
+            surface = gl.GLSurfacePlotItem(
+                x=self.unit(xs, x).astype(np.float32),
+                y=self.unit(ys, y).astype(np.float32),
+                z=zs * np.float32(st["zscale"]),
+                colors=np.ascontiguousarray(colors.reshape(-1, 4).astype(np.float32)),
+                shader='shaded' if st["shading"] else None,
+                smooth=True, glOptions='opaque')
+            self._items.append(surface)
+            if st["floor"]:
+                grid = gl.GLGridItem()
+                grid.setSize(2.0, 2.0)
+                grid.setSpacing(0.2, 0.2)
+                grid.setColor(QColor(0, 0, 0, 70))
+                self._items.append(grid)
+            for item in self._items:
+                self.view.addItem(item)
+        self.view.setCameraPosition(distance=st["distance"], elevation=st["elevation"],
+                                    azimuth=st["azimuth"])
+        # Aim at mid-height so the surface, not the floor, is centred in frame.
+        self.view.opts['center'] = pg.Vector(0, 0, 0.4 * st["zscale"])
+
+    def _style_key(self, st):
+        return (st["cmap"], st["shading"], st["floor"], st["zscale"],
+                st["azimuth"], st["elevation"], st["distance"])
+
+    def ink_box(self, st, aspect):
+        """Fractions (x0, y0, x1, y1) of a full render that the surface occupies."""
+        key = ("ink", self._style_key(st), round(aspect, 4))
+        if self._ink.get(key) is None:
+            self._sync(st)
+            w = 960
+            h = max(1, round(w / aspect))
+            a = np.ascontiguousarray(self.view.renderToArray((w, h)))[:, :, :3]
+            mask = (a < 245).any(axis=2)
+            rows, cols = np.nonzero(mask.any(axis=1))[0], np.nonzero(mask.any(axis=0))[0]
+            if not len(rows):
+                box = (0.0, 0.0, 1.0, 1.0)
+            else:
+                # One probe pixel of slack each way so antialiased edges aren't clipped.
+                box = (max(cols[0] - 1, 0) / w, max(rows[0] - 1, 0) / h,
+                       min(cols[-1] + 2, w) / w, min(rows[-1] + 2, h) / h)
+            self._ink = {key: box}
+        return self._ink[key]
+
+    def crop(self, st, W, H, x0, y0, cw, ch, supersample=False):
+        """Render only the (x0, y0, cw, ch) window of a virtual W x H frame."""
+        ss = 2 if supersample and cw * ch <= 12e6 else 1
+        key = (self._style_key(st), W, H, x0, y0, cw, ch, ss)
+        if self._snap[0] == key:
+            return self._snap[1]
+        self._sync(st)
+        arr = self._render_region(W * ss, H * ss, x0 * ss, y0 * ss, cw * ss, ch * ss)
+        img = QImage(arr.data, cw * ss, ch * ss, QImage.Format_ARGB32).copy()
+        if ss > 1:
+            img = img.scaled(cw, ch, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        self._snap = (key, img)
+        return img
+
+    def _render_region(self, W, H, x0, y0, cw, ch, tex=1024, pad=256):
+        # Same tiling as GLViewWidget.renderToArray, restricted to a sub-window.
+        view = self.view
+        view.makeCurrent()
+        fbo = QtOpenGL.QOpenGLFramebufferObject(
+            tex, tex, QtOpenGL.QOpenGLFramebufferObject.Attachment.CombinedDepthStencil,
+            _GL.GL_TEXTURE_2D)
+        out = np.full((ch, cw, 4), 255, dtype=np.ubyte)
+        data = np.empty((tex, tex, 4), dtype=np.ubyte)
+        try:
+            for x in range(x0 - pad, x0 + cw - pad, tex - 2 * pad):
+                for y in range(y0 - pad, y0 + ch - pad, tex - 2 * pad):
+                    x2 = min(x + tex, x0 + cw + pad)
+                    y2 = min(y + tex, y0 + ch + pad)
+                    w2, h2 = x2 - x, y2 - y
+                    fbo.bind()
+                    _GL.glViewport(0, 0, w2, h2)
+                    view.paint(region=(x, H - y - h2, w2, h2), viewport=(0, 0, W, H))
+                    fbo.bind()
+                    _GL.glReadPixels(0, 0, tex, tex, _GL.GL_BGRA, _GL.GL_UNSIGNED_BYTE, data)
+                    flip = data[::-1]
+                    out[y + pad - y0:y2 - pad - y0, x + pad - x0:x2 - pad - x0] = \
+                        flip[-(h2 - pad):-pad, pad:w2 - pad]
+        finally:
+            fbo.release()
+        return out
+
+    def projector(self, st, w, h):
+        """Map GL scene points to pixel positions in a w x h render."""
+        self._sync(st)
+        mvp = self.view.projectionMatrix((0, 0, w, h), (0, 0, w, h)) * self.view.viewMatrix()
+
+        def project(px, py, pz):
+            v = mvp.map(QVector4D(px, py, pz, 1.0))
+            if v.w() <= 0:
+                return None
+            return QPointF((v.x() / v.w() + 1) * 0.5 * w, (1 - v.y() / v.w()) * 0.5 * h)
+
+        return project
+
+
+def paint_surface_figure(p, renderer, st, W, H, ppi, img_scale=1.0, final=False):
+    """Lay out title, surface and colour bar on a W x H px canvas at *ppi*."""
+    data = renderer.data
+    pt = ppi / 72.0
+    fam = st["font"]
+
+    def font(scale=1.0):
+        f = QFont(fam)
+        f.setPixelSize(max(1, round(st["size"] * scale * pt)))
+        return f
+
+    black = QColor("#000000")
+    axis_pen = QPen(black, st["axis"] * pt)
+    tick_len, gap, m = 3.5 * pt, 2.5 * pt, 5 * pt
+    tick_font = font()
+    fm = QFontMetricsF(tick_font)
+    p.fillRect(QRectF(0, 0, W, H), QColor("#ffffff"))
+
+    top = m
+    if st["title"].strip():
+        title_h = _html_doc(st["title"], font(1.15)).size().height()
+        _text_at(p, st["title"], font(1.15), W / 2, m + title_h / 2)
+        top += title_h + m
+
+    z = data["z_3d"]
+    lo, hi = float(z.min()), float(z.max())
+    bar_w = 0.0
+    if st["colorbar"]:
+        bar_ticks = _nice_ticks(lo, hi, 5)
+        label_w = max(fm.horizontalAdvance(f"{v:g}") for v in bar_ticks)
+        bar_w = 9 * pt + tick_len + gap + label_w + m
+        if st["cbar"].strip():
+            bar_w += _html_doc(st["cbar"], font()).size().height() + gap
+
+    bar_block = bar_w - m if st["colorbar"] else 0.0
+    sep = 4 * gap if st["colorbar"] else 0.0
+    area = QRectF(m, top, W - 2 * m - bar_block - sep, H - top - m)
+    aspect = area.width() / max(area.height(), 1.0)
+    fx0, fy0, fx1, fy1 = renderer.ink_box(st, aspect)
+    fw, fh = fx1 - fx0, fy1 - fy0
+
+    def layout(T):
+        """Fit the surface's bounding box into T: (box on page, virtual W, H, projector)."""
+        Wv = min(T.width() / fw, T.height() * aspect / fh)
+        Hv = Wv / aspect
+        D = QRectF(0, 0, Wv * fw, Hv * fh)
+        D.moveCenter(T.center())
+        project = renderer.projector(st, Wv, Hv)
+        off = D.topLeft() - QPointF(fx0 * Wv, fy0 * Hv)
+
+        def P(gx, gy, gz):
+            q = project(gx, gy, gz)
+            return None if q is None else q + off
+
+        return D, Wv, Hv, P
+
+    def unit_dir(a, b):
+        d = b - a
+        n = (d.x() ** 2 + d.y() ** 2) ** 0.5 or 1.0
+        return QPointF(d.x() / n, d.y() / n)
+
+    th = fm.height()
+
+    def scene(p, L, image, mark):
+        """Surface, axes and markers laid out by *L*; *mark(rect)* records extent."""
+        D, _, _, P = L
+        if image is not None:
+            p.drawImage(D, image)
+        mark(D)
+        p.setPen(axis_pen)
+        p.setFont(tick_font)
+        drawn = []
+
+        def label(rect, flags, text):
+            # Where two axes meet at a corner their end labels can collide; keep the first.
+            if any(rect.intersects(r) for r in drawn):
+                return
+            drawn.append(rect)
+            p.drawText(rect, flags, text)
+            mark(rect)
+
+        def title(html, cx, cy, angle):
+            size = _text_at(p, html, font(), cx, cy, angle)
+            r = np.radians(angle)
+            hw = abs(np.cos(r)) * size.width() / 2 + abs(np.sin(r)) * size.height() / 2
+            hh = abs(np.sin(r)) * size.width() / 2 + abs(np.cos(r)) * size.height() / 2
+            mark(QRectF(cx - hw, cy - hh, 2 * hw, 2 * hh))
+
+        # Floor axes: draw each along whichever edge sits nearer the viewer.
+        centre = P(0, 0, 0)
+        used = {}
+        for along, values, axis_title in (("x", data["x_3d"], st["xlabel"]),
+                                          ("y", data["y_3d"], st["ylabel"])):
+            edges = []
+            for e in (-1.0, 1.0):
+                a = P(-1, e, 0) if along == "x" else P(e, -1, 0)
+                b = P(1, e, 0) if along == "x" else P(e, 1, 0)
+                if a is not None and b is not None:
+                    edges.append(((a.y() + b.y()) / 2, e, a, b))
+            if not edges or centre is None:
+                continue
+            _, e, a, b = max(edges, key=lambda t: t[0])
+            used[along] = e
+            p.setPen(axis_pen)
+            p.drawLine(a, b)
+            mid = (a + b) / 2
+            out = unit_dir(centre, mid)
+            extent = 0.0
+            for v in _nice_ticks(float(values[0]), float(values[-1]), 5):
+                u = float(renderer.unit([v], values)[0])
+                q = P(u, e, 0) if along == "x" else P(e, u, 0)
+                if q is None:
+                    continue
+                p.drawLine(q, q + out * tick_len)
+                text = f"{v:g}"
+                tw = fm.horizontalAdvance(text)
+                half = abs(out.x()) * tw / 2 + abs(out.y()) * th / 2
+                c = q + out * (tick_len + gap + half)
+                label(QRectF(c.x() - tw / 2, c.y() - th / 2, tw, th), Qt.AlignCenter, text)
+                extent = max(extent, 2 * half)
+            if axis_title.strip():
+                angle = np.degrees(np.arctan2(b.y() - a.y(), b.x() - a.x()))
+                if angle > 90:
+                    angle -= 180
+                elif angle <= -90:
+                    angle += 180
+                title_h = _html_doc(axis_title, font()).size().height()
+                c = mid + out * (tick_len + gap + extent + gap + title_h / 2)
+                title(axis_title, c.x(), c.y(), angle)
+
+        # Vertical dissonance axis on the leftmost side corner: never the front corner
+        # both floor axes meet at, never the back one where it would cross the surface.
+        if st["zaxis"] and centre is not None:
+            ex, ey = used.get("x", -1.0), used.get("y", -1.0)
+            sides = [(P(c[0], c[1], 0), c) for c in ((ey, -ex), (-ey, ex))]
+            sides = [s for s in sides if s[0] is not None]
+            cx, cy = min(sides, key=lambda s: s[0].x())[1] if sides else (ey, -ex)
+            base, tip = P(cx, cy, 0), P(cx, cy, st["zscale"])
+            if base is not None and tip is not None:
+                side = -1.0 if base.x() <= centre.x() else 1.0
+                p.setPen(axis_pen)
+                p.drawLine(base, tip)
+                widest = 0.0
+                for v in _nice_ticks(0.0, 1.0, 5):
+                    q = P(cx, cy, v * st["zscale"])
+                    if q is None:
+                        continue
+                    p.drawLine(q, q + QPointF(side * tick_len, 0))
+                    if v == 0:
+                        continue  # the floor corner already carries a floor-axis label
+                    text = f"{v:g}"
+                    tw = fm.horizontalAdvance(text)
+                    widest = max(widest, tw)
+                    x0 = q.x() - tick_len - gap - tw if side < 0 else q.x() + tick_len + gap
+                    label(QRectF(x0, q.y() - th / 2, tw, th),
+                          (Qt.AlignRight if side < 0 else Qt.AlignLeft) | Qt.AlignVCenter, text)
+                if st["zlabel"].strip():
+                    title_h = _html_doc(st["zlabel"], font()).size().height()
+                    reach = tick_len + gap + widest + gap + title_h / 2
+                    x = (min(base.x(), tip.x()) - reach) if side < 0 else (max(base.x(), tip.x()) + reach)
+                    title(st["zlabel"], x, (base.y() + tip.y()) / 2, -90)
+
+        # Best triads, drawn on top like the on-screen view.
+        tx, ty = data["tri_vis"][0], data["tri_vis"][1]
+        if (st["markers"] or st["labels"] != "None") and len(tx):
+            bi = [int(np.argmin(np.abs(data["x_3d"] - b))) for b in tx]
+            ci = [int(np.argmin(np.abs(data["y_3d"] - c))) for c in ty]
+            ub = renderer.unit(tx, data["x_3d"])
+            uc = renderer.unit(ty, data["y_3d"])
+            label_font = font(0.75)
+            for k in range(len(tx)):
+                q = P(float(ub[k]), float(uc[k]), float(z[bi[k], ci[k]]) * st["zscale"])
+                if q is None:
+                    continue
+                if st["markers"]:
+                    p.setPen(QPen(black, 0.5 * pt))
+                    p.setBrush(QColor("#ffffff"))
+                    r = 2.5 * pt
+                    p.drawEllipse(q, r, r)
+                    p.setBrush(Qt.NoBrush)
+                if st["labels"] != "None":
+                    if st["labels"] == "Ratio":
+                        text = f"{tx[k]:.3f} : {ty[k]:.3f}"
+                    else:
+                        text = f"{ratio_to_interval_name(tx[k])} \u00b7 {ratio_to_interval_name(ty[k])}"
+                        if st["labels"] == "Both":
+                            text += f"<br>{tx[k]:.3f} : {ty[k]:.3f}"
+                    doc = _html_doc(text, label_font)
+                    s = doc.size()
+                    box = QRectF(q.x() + 3 * pt, q.y() - s.height() - 2 * pt, s.width(), s.height())
+                    p.fillRect(box.adjusted(-pt, 0, pt, 0), QColor(255, 255, 255, 215))
+                    mark(box.adjusted(-pt, 0, pt, 0))
+                    p.save()
+                    p.translate(box.topLeft())
+                    doc.drawContents(p)
+                    p.restore()
+
+    probe = QImage(1, 1, QImage.Format_ARGB32)
+
+    def measure(L):
+        rects = []
+        pp = QPainter(probe)
+        try:
+            scene(pp, L, None, rects.append)
+        finally:
+            pp.end()
+        out = QRectF(rects[0])
+        for r in rects[1:]:
+            out = out.united(r)
+        return out
+
+    # Labels overhang the surface by roughly fixed amounts; shrink the target by
+    # that overhang so surface + labels fill the area, then re-check once.
+    T = QRectF(area)
+    for _ in range(2):
+        D = layout(T)[0]
+        C = measure(layout(T))
+        T = area.adjusted(D.left() - C.left(), D.top() - C.top(),
+                          D.right() - C.right(), D.bottom() - C.bottom())
+        if T.width() < 0.3 * area.width() or T.height() < 0.3 * area.height():
+            T = QRectF(area)
+            break
+    L = layout(T)
+    D, Wv, Hv, _ = L
+    C = measure(L)
+
+    group = C.width() + sep + bar_block
+    shift_x = m + max(0.0, (W - 2 * m - group) / 2) - C.left()
+    shift_y = top + max(0.0, (H - m - top - C.height()) / 2) - C.top()
+
+    s = img_scale
+    Wr, Hr = max(1, round(Wv * s)), max(1, round(Hv * s))
+    image = renderer.crop(st, Wr, Hr, int(fx0 * Wr), int(fy0 * Hr),
+                          max(1, round(fw * Wr)), max(1, round(fh * Hr)), supersample=final)
+    p.save()
+    p.translate(shift_x, shift_y)
+    scene(p, L, image, lambda r: None)
+    p.restore()
+
+    if st["colorbar"]:
+        bar = QRectF(C.right() + shift_x + sep, D.top() + shift_y + D.height() * 0.1,
+                     9 * pt, D.height() * 0.8)
+        cmap = pg.colormap.get(st["cmap"])
+        grad = QLinearGradient(bar.bottomLeft(), bar.topLeft())
+        for t, c in zip(np.linspace(0, 1, 33), cmap.map(np.linspace(0, 1, 33), mode='qcolor')):
+            grad.setColorAt(float(t), c)
+        p.fillRect(bar, grad)
+        p.setPen(axis_pen)
+        p.drawRect(bar)
+        widest = 0.0
+        for v in _nice_ticks(lo, hi, 5):
+            yv = bar.bottom() - (v - lo) / max(hi - lo, 1e-12) * bar.height()
+            p.drawLine(QPointF(bar.right(), yv), QPointF(bar.right() + tick_len, yv))
+            text = f"{v:g}"
+            tw = fm.horizontalAdvance(text)
+            widest = max(widest, tw)
+            p.drawText(QRectF(bar.right() + tick_len + gap, yv - th / 2, tw, th),
+                       Qt.AlignLeft | Qt.AlignVCenter, text)
+        if st["cbar"].strip():
+            title_h = _html_doc(st["cbar"], font()).size().height()
+            x = bar.right() + tick_len + gap + widest + gap + title_h / 2
+            _text_at(p, st["cbar"], font(), x, bar.center().y(), -90)
+
+
+def render_surface_figure(renderer, st, path):
+    fmt = st["fmt"]
+    dpi = float(st["dpi"])
+    ppi = dpi if fmt == "png" else SCREEN_DPI
+    W, H = round(st["width"] * ppi), round(st["height"] * ppi)
+    _write_device(path, fmt, W, H, ppi, st,
+                  lambda p: paint_surface_figure(p, renderer, st, W, H, ppi, dpi / ppi,
+                                                 final=True))
+
+
+class SurfaceEditor(FigureEditor):
+    """Figure editor for the 3D surface: a snapshot at the on-screen angle,
+    with every label, the colour bar and the styling editable on top."""
+
+    def __init__(self, renderer, data, state, parent=None):
+        self._renderer = renderer
+        self._preview = None
+        super().__init__("surface", data, state, parent)
+
+    def _build_form(self, form, section):
+        section("TEXT")
+        form.addRow("Title", self._line("title"))
+        form.addRow("B axis", self._line("xlabel"))
+        form.addRow("C axis", self._line("ylabel"))
+        form.addRow("Height axis", self._line("zlabel"))
+        form.addRow("Colour bar", self._line("cbar"))
+        self._rich_text_tip(form)
+
+        section("STYLE")
+        form.addRow("Font", self._combo("font", FIG_FONTS))
+        form.addRow("Font size (pt)", self._num("size", 5, 24, 0.5, 1))
+        form.addRow("Axes (pt)", self._num("axis", 0.1, 4, 0.1, 2))
+        form.addRow("Colour map", self._combo("cmap", FIG_CMAPS))
+        form.addRow("Surface", self._combo("shading", [("Lit", True), ("Flat colour", False)]))
+        form.addRow(self._check("floor", "Floor grid"))
+        form.addRow(self._check("zaxis", "Dissonance axis"))
+        form.addRow(self._check("colorbar", "Colour bar"))
+        form.addRow(self._check("markers", "Mark best triads"))
+        form.addRow("Triad labels", self._combo("labels", [(m, m) for m in FIG_LABEL_MODES]))
+        angle = QLabel("The view angle is taken from the Surface tab — rotate "
+                       "it there before opening this editor.")
+        angle.setObjectName("hint")
+        angle.setWordWrap(True)
+        form.addRow(angle)
+
+        self._output_rows(form, section, "Resolution (dpi)")
+        note = QLabel("PDF/SVG keep text and axes as vectors; the surface is "
+                      "embedded at this resolution.")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow(note)
+
+    def _rebuild(self):
+        if self._preview is None:
+            self._preview = QLabel()
+            self.canvas.setWidget(self._preview)
+        st = self.state
+        W, H = round(st["width"] * SCREEN_DPI), round(st["height"] * SCREEN_DPI)
+        image = QImage(W, H, QImage.Format_ARGB32)
+        image.fill(QColor("#ffffff"))
+        p = QPainter(image)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        try:
+            paint_surface_figure(p, self._renderer, st, W, H, SCREEN_DPI)
+        finally:
+            p.end()
+        self._preview.setPixmap(QPixmap.fromImage(image))
+        self._preview.setFixedSize(W, H)
+        self.msg.setText(f"Actual size preview \u00b7 {st['width']:g} \u00d7 {st['height']:g} in")
+
+    def _write(self, path):
+        render_surface_figure(self._renderer, self.state, path)
+
+
+def _safe_filename(text):
+    keep = [ch if (ch.isalnum() or ch in "._-") else "_" for ch in text]
+    return "".join(keep).strip("_") or "export"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1365,6 +2685,10 @@ class MainWindow(QMainWindow):
 
         self.data = None
         self.worker = None
+        self._last_sound = None
+        self._dot_color = BLUE
+        self._fig_state = {}
+        self._surface_renderer = None
 
         self._build_ui()
         QTimer.singleShot(80, self.analyse)
@@ -1375,8 +2699,8 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         lay = QHBoxLayout(root)
-        lay.setContentsMargins(14, 14, 14, 14)
-        lay.setSpacing(12)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(10)
 
         lay.addWidget(self._build_sidebar(), 0)
 
@@ -1397,44 +2721,42 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(392)
+        scroll.setFixedWidth(340)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         inner = QWidget()
         col = QVBoxLayout(inner)
         col.setContentsMargins(0, 0, 8, 0)
-        col.setSpacing(12)
+        col.setSpacing(8)
 
-        header = QVBoxLayout()
-        header.setSpacing(2)
-        sub = QLabel("SENSORY DISSONANCE")
-        sub.setObjectName("appSub")
-        title = QLabel("Dissonance Explorer")
-        title.setObjectName("appTitle")
-        header.addWidget(sub)
-        header.addWidget(title)
-        col.addLayout(header)
-
-        self.card_a = SpectrumCard("A", "root voice")
-        self.card_b = SpectrumCard("B", "moving voice",
-                                   copy_sources=[("A", self.card_a)])
-        self.card_c = SpectrumCard("C", "third voice",
-                                   copy_sources=[("A", self.card_a),
-                                                 ("B", self.card_b)])
+        voices = Card("voices")
+        self.voice_seg = Segmented(["A", "B", "C"])
+        voices.body.addWidget(self.voice_seg)
+        self.voice_stack = QStackedWidget()
+        self.voice_stack.setObjectName("plain")
+        self.card_a = SpectrumCard("A")
+        self.card_b = SpectrumCard("B", copy_sources=[("A", self.card_a)])
+        self.card_c = SpectrumCard("C", copy_sources=[("A", self.card_a),
+                                                      ("B", self.card_b)])
         for card in (self.card_a, self.card_b, self.card_c):
             card.playRequested.connect(self._play_card)
-            col.addWidget(card)
+            card.sourceChanged.connect(self._label_voice_tabs)
+            self.voice_stack.addWidget(card)
+        self.voice_seg.changed.connect(self.voice_stack.setCurrentIndex)
+        voices.body.addWidget(self.voice_stack)
+        col.addWidget(voices)
+        self._label_voice_tabs()
 
         settings = Card("analysis")
         grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        self.f_ref = Field("FUNDAMENTAL (Hz)", "261.63")
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        self.f_ref = Field("FUNDAMENTAL Hz", "261.63")
         self.f_max = Field("MAX RATIO", "2.3")
         self.f_step = Field("3D STEP", "0.005")
         grid.addWidget(self.f_ref, 0, 0)
         grid.addWidget(self.f_max, 0, 1)
-        grid.addWidget(self.f_step, 1, 0)
+        grid.addWidget(self.f_step, 0, 2)
         settings.body.addLayout(grid)
 
         actions = QHBoxLayout()
@@ -1455,32 +2777,53 @@ class MainWindow(QMainWindow):
         col.addWidget(settings)
 
         manual = Card("manual playback")
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
-        self.f_interval = Field("INTERVAL  A + B", "1.5")
-        row1.addWidget(self.f_interval, 1)
-        b1 = QPushButton("\u25b6")
-        b1.setObjectName("icon")
-        b1.setCursor(Qt.PointingHandCursor)
-        b1.clicked.connect(self._play_manual_interval)
-        row1.addWidget(b1, 0, Qt.AlignBottom)
-        manual.body.addLayout(row1)
+        self.f_note = Field("Note A", "1.0", inline=True)
+        self.f_interval = Field("A + B", "1.5", inline=True)
+        self.f_triad = Field("Triad B, C", "1.25, 1.5", inline=True)
+        rows = ((self.f_note, self._play_manual_note, "Play voice A on its own at this ratio"),
+                (self.f_interval, self._play_manual_interval, "Play A with B at this ratio"),
+                (self.f_triad, self._play_manual_triad, "Play A, B and C at these ratios"))
+        for field, slot, tip in rows:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(field, 1)
+            btn = QPushButton("\u25b6")
+            btn.setObjectName("icon")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            row.addWidget(btn, 0)
+            manual.body.addLayout(row)
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        self.f_triad = Field("TRIAD  B, C", "1.25, 1.5")
-        row2.addWidget(self.f_triad, 1)
-        b2 = QPushButton("\u25b6")
-        b2.setObjectName("icon")
-        b2.setCursor(Qt.PointingHandCursor)
-        b2.clicked.connect(self._play_manual_triad)
-        row2.addWidget(b2, 0, Qt.AlignBottom)
-        manual.body.addLayout(row2)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.f_duration = Field("Length (s)", "1.5", inline=True)
+        row.addWidget(self.f_duration, 1)
+        btn_wav = QPushButton("Save WAV\u2026")
+        btn_wav.setCursor(Qt.PointingHandCursor)
+        btn_wav.setToolTip("Write the last sound you played to a 24-bit WAV "
+                           "file of this length")
+        btn_wav.clicked.connect(self._export_wav)
+        row.addWidget(btn_wav, 0)
+        manual.body.addLayout(row)
         col.addWidget(manual)
 
         col.addStretch(1)
         scroll.setWidget(inner)
         return scroll
+
+    def _label_voice_tabs(self):
+        if not hasattr(self, "voice_seg"):
+            return
+        for i, card in enumerate((self.card_a, self.card_b, self.card_c)):
+            text = card.letter
+            if card.is_linked():
+                text += f" = {card.copy_combo.currentText().removeprefix('Same as ')}"
+            btn = self.voice_seg.group.button(i)
+            btn.setText(text)
+            btn.setStyleSheet(
+                f"QPushButton#segBtn, QPushButton#segBtn:hover, "
+                f"QPushButton#segBtn:checked {{ color: {card.color}; }}")
 
     def _build_plot_area(self):
         wrap = QWidget()
@@ -1489,16 +2832,27 @@ class MainWindow(QMainWindow):
         col.setSpacing(10)
 
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(8)
         self.tabs = Segmented(["Curve", "Surface", "Heatmap"])
         self.tabs.changed.connect(self._switch_tab)
         top.addWidget(self.tabs, 0)
         self.view_hint = QLabel()
         self.view_hint.setObjectName("hint")
-        top.addWidget(self.view_hint, 0)
         top.addStretch(1)
 
-        self.btn_reset_view = QPushButton("Reset view")
+        self.range_seg = Segmented(["Default", "MAX (3 Octaves)"])
+        self.range_seg.setToolTip(f"Show the curve up to ratio {EXTENDED_MAX:g}")
+        self.range_seg.changed.connect(self._on_range_changed)
+        top.addWidget(self.range_seg, 0)
+
+        self.btn_export = QPushButton("Save figure\u2026")
+        self.btn_export.setCursor(Qt.PointingHandCursor)
+        self.btn_export.setToolTip("Open the figure editor for a publication-ready export")
+        self.btn_export.clicked.connect(self._export_figure)
+        top.addWidget(self.btn_export, 0)
+
+        self.btn_reset_view = QPushButton("Reset")
+        self.btn_reset_view.setToolTip("Reset the view")
         self.btn_reset_view.setCursor(Qt.PointingHandCursor)
         self.btn_reset_view.clicked.connect(self._reset_view)
         top.addWidget(self.btn_reset_view, 0)
@@ -1519,6 +2873,28 @@ class MainWindow(QMainWindow):
         inner.addWidget(self.stack)
         col.addWidget(card, 1)
 
+        ot_card = QFrame()
+        ot_card.setObjectName("plotCard")
+        ot = QVBoxLayout(ot_card)
+        ot.setContentsMargins(10, 6, 10, 4)
+        ot.setSpacing(2)
+        ot_head = QHBoxLayout()
+        ot_head.setSpacing(10)
+        ot_title = QLabel("OVERTONES")
+        ot_title.setObjectName("cardTitle")
+        ot_head.addWidget(ot_title, 0)
+        self.overtone_legend = QLabel()
+        self.overtone_legend.setObjectName("hint")
+        ot_head.addWidget(self.overtone_legend, 1)
+        self.overtone_info = QLabel("Play something to see how its partials line up")
+        self.overtone_info.setObjectName("hint")
+        ot_head.addWidget(self.overtone_info, 0)
+        ot.addLayout(ot_head)
+        self.overtone_view = OvertoneView()
+        self.overtone_view.setFixedHeight(92)
+        ot.addWidget(self.overtone_view)
+        col.addWidget(ot_card, 0)
+
         self.curve_view.picked.connect(self._play_interval_ratio)
         self.heatmap_view.picked.connect(self._play_triad_ratio)
         self.surface_view.picked.connect(self._play_triad_ratio)
@@ -1538,6 +2914,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         status.addWidget(self.status_dot, 0)
         status.addWidget(self.status_label, 1)
+        status.addWidget(self.view_hint, 0)
         status.addWidget(self.progress, 0)
         col.addLayout(status)
         return wrap
@@ -1580,10 +2957,12 @@ class MainWindow(QMainWindow):
         tp = QVBoxLayout(triads_page)
         tp.setContentsMargins(0, 0, 0, 0)
         tp.setSpacing(8)
-        hint = QLabel("Ranked by lowest dissonance")
-        hint.setObjectName("hint")
-        hint.setContentsMargins(8, 2, 0, 0)
-        tp.addWidget(hint)
+        self.triad_seg = Segmented(["Within octave", "All voicings"])
+        self.triad_seg.changed.connect(lambda _: self._refresh_triads())
+        triad_row = QHBoxLayout()
+        triad_row.setContentsMargins(4, 0, 4, 0)
+        triad_row.addWidget(self.triad_seg, 1)
+        tp.addLayout(triad_row)
         self.list_triads = ResultList()
         self.list_triads.activatedRow.connect(
             lambda p: self._play_triad_ratio(p[0], p[1]))
@@ -1594,12 +2973,24 @@ class MainWindow(QMainWindow):
         inner.addWidget(self.res_stack)
         col.addWidget(card, 1)
 
-        wrap.setMinimumWidth(300)
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(8)
+        theme_row.addStretch(1)
+        theme_cap = QLabel("Theme")
+        theme_cap.setObjectName("fieldLabel")
+        theme_row.addWidget(theme_cap, 0)
+        self.theme_seg = Segmented(["Dark", "Light"])
+        self.theme_seg.changed.connect(self._set_theme)
+        theme_row.addWidget(self.theme_seg, 0)
+        col.addLayout(theme_row)
+
+        wrap.setMinimumWidth(240)
         return wrap
 
     # ── helpers ────────────────────────────────────────────────────────────
 
     def _set_dot(self, color):
+        self._dot_color = color
         self.status_dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
 
     def _status(self, text, color=BLUE):
@@ -1615,13 +3006,27 @@ class MainWindow(QMainWindow):
     def _switch_tab(self, index):
         self.stack.setCurrentIndex(index)
         self.view_hint.setText(self.VIEW_HINTS[index])
+        self.range_seg.setVisible(index == 0)
+
+    def _view_xmax(self):
+        """Upper ratio currently shown on the curve."""
+        mx = self.data["max_interval"] if self.data is not None else self.max_interval
+        if self.range_seg.group.checkedId() == 1:
+            return max(EXTENDED_MAX, mx)
+        return mx
+
+    def _apply_range(self):
+        self.curve_view.setViewRatioRange(self._view_xmax())
+        self._fill_intervals()
+
+    def _on_range_changed(self, _index):
+        if self.data is not None:
+            self._apply_range()
 
     def _reset_view(self):
         i = self.stack.currentIndex()
         if i == 0 and self.data is not None:
-            self.curve_view.setXRange(0.9, self.max_interval, padding=0.01)
-            self.curve_view.setYRange(
-                0, float(self.data["diss_2d"].max()) * 1.08, padding=0)
+            self.curve_view.setViewRatioRange(self._view_xmax())
         elif i == 1:
             self.surface_view.resetView()
         elif i == 2 and self.data is not None:
@@ -1668,8 +3073,10 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self._status("Computing dissonance space\u2026", YELLOW)
 
+        wide = max(EXTENDED_MAX, self.max_interval)
         self.worker = ComputeWorker(spec_a, spec_b, spec_c, self.ref_freq,
-                                    self.max_interval, self.step_2d, self.step_3d)
+                                    self.max_interval, self.step_2d,
+                                    self.step_3d, max_2d=wide)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.finished_ok.connect(self._on_results)
         self.worker.failed.connect(self._on_failed)
@@ -1682,24 +3089,25 @@ class MainWindow(QMainWindow):
 
     def _on_results(self, data):
         self.data = data
+        if self._surface_renderer is not None:
+            self._surface_renderer.close()
+            self._surface_renderer = None
         self.btn_run.setEnabled(True)
         self.progress.setVisible(False)
 
         self.curve_view.setData(data["ratios_2d"], data["diss_2d"],
                                 data["minima_x"], data["minima_y"],
-                                self.max_interval)
-        self.heatmap_view.setData(data["x_3d"], data["y_3d"], data["z_3d"],
-                                  data["tri_x"], data["tri_y"], data["tri_z"])
-        self.surface_view.setData(data["x_3d"], data["y_3d"], data["z_3d"],
-                                  data["tri_x"], data["tri_y"], data["tri_z"])
+                                self._view_xmax())
         self._fill_intervals()
-        self._fill_triads()
+        self._refresh_triads()
         self._status("Ready \u2014 click any plot or list entry to hear it", GREEN)
 
     def _fill_intervals(self):
         if self.data is None:
             return
-        pairs = list(zip(self.data["minima_x"], self.data["minima_y"]))
+        xmax = self._view_xmax()
+        pairs = [(x, y) for x, y in zip(self.data["minima_x"],
+                                        self.data["minima_y"]) if x <= xmax]
         if self.sort_seg.group.checkedId() == 0:
             pairs.sort(key=lambda p: p[1])
         else:
@@ -1710,18 +3118,54 @@ class MainWindow(QMainWindow):
                 for x, y in pairs]
         self.list_intervals.setRows(rows, "No consonant minima found")
 
-    def _fill_triads(self):
+    def _visible_triads(self, limit=10):
+        """Best triads for display, optionally restricted to within one octave."""
+        bx = self.data["tri_x"]
+        cy = self.data["tri_y"]
+        dz = self.data["tri_z"]
+        if self.triad_seg.group.checkedId() == 0:
+            # 10-cent guard: anything nearer than this just reads as an octave.
+            octave = 2.0 * 2 ** (-10 / 1200)
+            keep = (bx < octave) & (cy < octave)
+            bx, cy, dz = bx[keep], cy[keep], dz[keep]
+        order = np.argsort(dz)[:limit]
+        return bx[order], cy[order], dz[order]
+
+    def _refresh_triads(self):
         if self.data is None:
             return
-        triads = list(zip(self.data["tri_x"], self.data["tri_y"], self.data["tri_z"]))
-        triads.sort(key=lambda t: t[2])
+        tx, ty, tz = self._visible_triads()
+        d = self.data
+        self.heatmap_view.setData(d["x_3d"], d["y_3d"], d["z_3d"], tx, ty, tz)
+        self.surface_view.setData(d["x_3d"], d["y_3d"], d["z_3d"], tx, ty, tz)
         rows = [(f"1.000 : {bx:.3f} : {cy:.3f}",
                  f"{ratio_to_interval_name(bx)}  \u00b7  {ratio_to_interval_name(cy)}",
                  float(dz), (float(bx), float(cy)))
-                for bx, cy, dz in triads]
+                for bx, cy, dz in zip(tx, ty, tz)]
         self.list_triads.setRows(rows, "No consonant triads found")
 
     # ── playback ───────────────────────────────────────────────────────────
+
+    def _sound(self, voices, label, letters="ABC"):
+        """Play *voices*, show their overtones, and remember them for WAV export."""
+        self._last_sound = (voices, label)
+        self._shown_overtones = [(letters[i], spec, ratio)
+                                 for i, (spec, ratio) in enumerate(voices)]
+        self._show_overtones()
+        play_multi(voices, self.ref_freq)
+
+    def _show_overtones(self):
+        shown = getattr(self, "_shown_overtones", None)
+        if not shown:
+            return
+        matches = self.overtone_view.setVoices(shown, self.ref_freq)
+        dots = "  ".join(f"<span style='color:{VOICE_COLORS[l]}'>\u25cf</span> "
+                          f"{l} {ratio:.3f}" for l, _, ratio in shown)
+        key = (f"  \u00b7  <span style='color:{TEXT}'>\u25ef</span> shared"
+               if len(shown) > 1 else "")
+        self.overtone_legend.setText(dots + key)
+        self.overtone_info.setText(
+            f"{matches} shared partials" if len(shown) > 1 else "single voice")
 
     def _play_card(self, card):
         if not self._read_settings():
@@ -1731,7 +3175,7 @@ class MainWindow(QMainWindow):
             self._status(f"Voice {card.letter} has invalid input", RED)
             return
         self._status(f"Playing voice {card.letter} alone", GREEN)
-        play_multi([(spec, 1.0)], self.ref_freq)
+        self._sound([(spec, 1.0)], f"voice_{card.letter}", letters=card.letter)
 
     def _diss_at_ratio(self, ratio):
         if self.data is None:
@@ -1758,7 +3202,8 @@ class MainWindow(QMainWindow):
         tail = f" \u00b7 diss {d:.3f}" if d is not None else ""
         self._status(f"A 1.000 + B {ratio:.4f}  ({ratio_to_interval_name(ratio)})"
                      f"{tail}", GREEN)
-        play_multi([(spec_a, 1.0), (spec_b, ratio)], self.ref_freq)
+        self._sound([(spec_a, 1.0), (spec_b, ratio)],
+                    f"interval_{ratio:.4f}")
 
     def _play_triad_ratio(self, rb, rc):
         if not self._read_settings():
@@ -1770,7 +3215,8 @@ class MainWindow(QMainWindow):
         d = self._diss_at_triad(rb, rc)
         tail = f" \u00b7 diss {d:.3f}" if d is not None else ""
         self._status(f"A 1.000 + B {rb:.3f} + C {rc:.3f}{tail}", GREEN)
-        play_multi([(spec_a, 1.0), (spec_b, rb), (spec_c, rc)], self.ref_freq)
+        self._sound([(spec_a, 1.0), (spec_b, rb), (spec_c, rc)],
+                    f"triad_{rb:.3f}_{rc:.3f}")
 
     def _play_manual_interval(self):
         try:
@@ -1779,6 +3225,24 @@ class MainWindow(QMainWindow):
             self._status("Interval must be a single number", RED)
             return
         self._play_interval_ratio(ratio)
+
+    def _play_manual_note(self):
+        try:
+            ratio = float(self.f_note.text())
+        except ValueError:
+            self._status("Note must be a single number", RED)
+            return
+        if ratio <= 0:
+            self._status("Note ratio must be positive", RED)
+            return
+        if not self._read_settings():
+            return
+        spec_a = self.card_a.get_spectrum()
+        if spec_a is None:
+            self._status("Voice A has invalid input", RED)
+            return
+        self._status(f"A {ratio:.4f} alone  ({ratio_to_interval_name(ratio)})", GREEN)
+        self._sound([(spec_a, ratio)], f"note_{ratio:.4f}")
 
     def _play_manual_triad(self):
         try:
@@ -1790,6 +3254,108 @@ class MainWindow(QMainWindow):
             self._status("Enter exactly two ratios (B, C)", RED)
             return
         self._play_triad_ratio(parts[0], parts[1])
+
+    # ── theme ──────────────────────────────────────────────────────────────
+
+    def _set_theme(self, index):
+        apply_app_theme(QApplication.instance(),
+                        PAPER_PALETTE if index == 1 else DARK_PALETTE)
+        self._restyle()
+
+    def _restyle(self):
+        """Re-read the active palette everywhere it was baked in at build time."""
+        for card in (self.card_a, self.card_b, self.card_c):
+            card.apply_palette()
+        self.curve_view.apply_palette()
+        self.heatmap_view.apply_palette()
+        self.surface_view.apply_palette()
+        self.overtone_view.apply_palette()
+        self._show_overtones()
+        self._set_dot(self._dot_color)
+        self._label_voice_tabs()
+        if self.data is not None:
+            self._fill_intervals()
+            self._refresh_triads()
+
+    # ── export ─────────────────────────────────────────────────────────────
+
+    VIEW_NAMES = ("curve", "surface", "heatmap")
+
+    def _export_figure(self):
+        if self.data is None:
+            self._status("Nothing to export yet \u2014 run an analysis first", RED)
+            return
+        index = self.stack.currentIndex()
+        kind = self.VIEW_NAMES[index]
+        if kind == "surface" and not HAS_GL:
+            self._status("The 3D surface is unavailable on this machine", RED)
+            return
+        st = dict(SURFACE_DEFAULTS) if kind == "surface" else {
+            **FIGURE_COMMON, **FIGURE_DEFAULTS[kind]}
+        st.update(self._fig_state.get(kind, {}))
+        data = self.data
+        if kind == "curve":
+            r = data["ratios_2d"]
+            (x0, x1), _ = self.curve_view.viewRange()
+            st["xmin"] = round(max(float(x0), float(r[0])), 3)
+            st["xmax"] = round(min(float(x1), float(r[-1])), 3)
+            st["ymax"] = 0.0
+        else:
+            data = dict(data, tri_vis=self._visible_triads())
+        if kind == "surface":
+            cam = self.surface_view.cameraParams()
+            st.update(azimuth=float(cam["azimuth"]), elevation=float(cam["elevation"]),
+                      distance=float(cam["distance"]))
+
+        self.curve_view.hideCrosshair()
+        if kind == "surface":
+            if self._surface_renderer is None:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    self._surface_renderer = SurfaceRenderer(data)
+                finally:
+                    QApplication.restoreOverrideCursor()
+            self._surface_renderer.data = data
+            editor = SurfaceEditor(self._surface_renderer, data, st, parent=self)
+        else:
+            editor = FigureEditor(kind, data, st, parent=self)
+        editor.exec()
+        # Text and style carry over to the next figure; ranges and camera follow the view.
+        skip = ("xmin", "xmax", "ymax") + SURFACE_CAMERA_KEYS
+        self._fig_state[kind] = {k: v for k, v in editor.state.items() if k not in skip}
+        if editor.saved_path:
+            self._status(f"Figure saved to {Path(editor.saved_path).name}", GREEN)
+
+    def _export_wav(self):
+        if self._last_sound is None:
+            self._status("Play something first, then save it", RED)
+            return
+        if not self._read_settings():
+            return
+        try:
+            seconds = float(self.f_duration.text())
+        except ValueError:
+            self._status("Length must be a number of seconds", RED)
+            return
+        if not 0.05 <= seconds <= 600:
+            self._status("Length must be between 0.05 and 600 seconds", RED)
+            return
+
+        voices, label = self._last_sound
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save sound", _safe_filename(label) + ".wav",
+            "WAV audio (*.wav)")
+        if not path:
+            return
+        if not path.lower().endswith(".wav"):
+            path += ".wav"
+        try:
+            write_wav(path, synthesize_multi(voices, self.ref_freq,
+                                             duration=seconds))
+        except Exception as exc:
+            self._status(f"Could not write the file: {exc}", RED)
+            return
+        self._status(f"Saved {seconds:g}\u202fs to {Path(path).name}", GREEN)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -1804,22 +3370,29 @@ class MainWindow(QMainWindow):
 #  Entry point
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
+def apply_app_theme(app, palette_dict):
+    """Switch the whole application over to *palette_dict*."""
+    apply_palette(palette_dict)
     pg.setConfigOptions(antialias=True, background=MANTLE, foreground=TEXT)
 
+    qp = app.palette()
+    qp.setColor(QPalette.Window, QColor(BASE))
+    qp.setColor(QPalette.Base, QColor(SURFACE))
+    qp.setColor(QPalette.Text, QColor(TEXT))
+    qp.setColor(QPalette.WindowText, QColor(TEXT))
+    qp.setColor(QPalette.Highlight, QColor(BLUE))
+    qp.setColor(QPalette.HighlightedText, QColor(BASE))
+    app.setPalette(qp)
+    app.setStyleSheet(build_qss(palette_dict))
+
+
+def main():
+    # pyqtgraph caches compiled shaders globally, so every GL widget must share one context group.
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("Dissonance Explorer")
     app.setStyle("Fusion")
-
-    palette = app.palette()
-    palette.setColor(QPalette.Window, QColor(BASE))
-    palette.setColor(QPalette.Base, QColor(SURFACE))
-    palette.setColor(QPalette.Text, QColor(TEXT))
-    palette.setColor(QPalette.WindowText, QColor(TEXT))
-    palette.setColor(QPalette.Highlight, QColor(BLUE))
-    palette.setColor(QPalette.HighlightedText, QColor(BASE))
-    app.setPalette(palette)
-    app.setStyleSheet(build_qss())
+    apply_app_theme(app, DARK_PALETTE)
 
     window = MainWindow()
     window.showMaximized()
