@@ -1,0 +1,6 @@
+numpy
+matplotlib
+sounddevice
+PySide6
+pyqtgraph
+PyOpenGL

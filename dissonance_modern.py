@@ -1,19 +1,15 @@
 """
 Dissonance Explorer — a modern, GPU-accelerated interface for the
-Plomp-Levelt / Sethares sensory-dissonance model.
-
-This is a standalone rewrite of `dissonance_gui.py` using PySide6 + pyqtgraph.
-The mathematics (dissonance model, minima detection, additive synthesis) is
-carried over unchanged; only the presentation layer is new.
+Plomp-Levelt / Sethares sensory-dissonance model, built with PySide6 + pyqtgraph.
 
 Features
 --------
-* Three independent spectra (A, B, C) with live partial previews
+* Three independent spectra (A, B, C) with presets, linking and live previews
 * Interactive 2D dissonance curve with crosshair readout, zoom/pan, click-to-play
 * Heatmap of the triad space with topographic iso-contours
 * True OpenGL 3D dissonance surface with accurate ray-cast click-to-play
 * Ranked lists of consonant intervals and consonant triads
-* Additive-synthesis playback of everything
+* Additive-synthesis playback, WAV export and publication-figure export
 
 Requirements: numpy, sounddevice, PySide6, pyqtgraph, PyOpenGL
 Run:          python dissonance_modern.py
@@ -56,15 +52,14 @@ except Exception:  # pragma: no cover - depends on local OpenGL support
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Dissonance model  (unchanged from dissonance_gui.py)
+#  Dissonance model
 # ═══════════════════════════════════════════════════════════════════════════
 
 SAMPLE_RATE = 44100
 DURATION = 1.5
 
-# Curve and surface are always evaluated out to this ratio so minima beyond the
-# default MAX RATIO still get found.
-EXTENDED_MAX = 3.3
+# The curve is computed this far so it can be panned past MAX RATIO and minima near it aren't clipped.
+CURVE_MAX = 3.3
 
 
 def amp_to_loudness(amp):
@@ -226,11 +221,12 @@ def compute_dissonance_3d(spec_a, spec_b, spec_c, ref_freq, max_interval, step_s
     return ratios, ratios, z_data
 
 
-def find_minima(ratios, dissonance_values, window=5, min_prominence=0.0000135):
+def find_minima(ratios, dissonance_values, window=5, min_prominence=0.002):
     """Find local minima with significant prominence (depth relative to surroundings).
 
-    A minimum is only kept if the difference between the highest nearby peak
-    and the minimum value is at least min_prominence (on the 0-1 normalized scale).
+    A minimum is kept only if it sits at least min_prominence (on the 0-1
+    normalised scale) below the lower of the two peaks that separate it from
+    lower ground (or from the end of the curve).
     """
     # Step 1: find all local minima
     candidates = []
@@ -246,19 +242,18 @@ def find_minima(ratios, dissonance_values, window=5, min_prominence=0.0000135):
     for idx in candidates:
         val = dissonance_values[idx]
 
-        # Left: scan left until we find a value higher than val, track the max on the way
+        # Highest point on each side before the curve drops below the valley
         left_max = val
         for j in range(idx - 1, -1, -1):
-            left_max = max(left_max, dissonance_values[j])
-            if dissonance_values[j] > val:
+            if dissonance_values[j] < val:
                 break
+            left_max = max(left_max, dissonance_values[j])
 
-        # Right: scan right
         right_max = val
         for j in range(idx + 1, n):
-            right_max = max(right_max, dissonance_values[j])
-            if dissonance_values[j] > val:
+            if dissonance_values[j] < val:
                 break
+            right_max = max(right_max, dissonance_values[j])
 
         # Prominence = height of the lower of the two surrounding peaks minus the valley
         prominence = min(left_max, right_max) - val
@@ -270,41 +265,93 @@ def find_minima(ratios, dissonance_values, window=5, min_prominence=0.0000135):
     return np.array(minima_x), np.array(minima_y)
 
 
-def find_minima_3d(ratios_x, ratios_y, z_data, window=5, top_n=10):
-    """Find the most consonant triads (lowest dissonance local minima).
+def _triad_cost(spec_a, spec_b, spec_c, ref_freq):
+    """Exact, unnormalised dissonance of A : rB : sC as a function of (ln r, ln s)."""
+    voices = (spec_a, spec_b, spec_c)
+    base = np.concatenate([ref_freq * np.asarray(v["freq"], dtype=float) for v in voices])
+    loud = np.concatenate([amp_to_loudness(np.asarray(v["amp"], dtype=float))
+                           for v in voices])
+    owner = np.repeat([0, 1, 2], [len(v["freq"]) for v in voices])
+    i, j = np.triu_indices(len(base), k=1)
+    li, lj = loud[i], loud[j]
 
-    *z_data* is indexed ``[voice B index, voice C index]``.  A grid point is a
-    local minimum if it's the smallest value in its (2*window+1) x (2*window+1)
-    neighbourhood.  Results are sorted by absolute dissonance (lowest first)
-    and capped at *top_n*.
+    def cost(u, v):
+        f = base * np.array([1.0, np.exp(u), np.exp(v)])[owner]
+        return float(dissonance_pair_vectorized(f[i], f[j], li, lj).sum())
+    return cost
+
+
+# In (ln r, ln s) the valleys from A-B, A-C and B-C partial coincidences run along
+# these three directions, so the search can slide along any of them.
+_TRIAD_DIRS = ((0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (-1, -1))
+
+
+def _descend(cost, u, v, h, lo, hi, tol=1e-6):
+    """Pattern search down to a local minimum; None if it leaves the [lo, hi] box."""
+    best = cost(u, v)
+    while h > tol:
+        moved = False
+        for du, dv in _TRIAD_DIRS:
+            c = cost(u + du * h, v + dv * h)
+            if c < best:
+                u, v, best = u + du * h, v + dv * h, c
+                moved = True
+                break
+        if not moved:
+            h *= 0.5
+        elif not (lo[0] <= u <= hi[0] and lo[1] <= v <= hi[1]):
+            return None
+    return u, v, best
+
+
+def find_minima_3d(ratios_x, ratios_y, z_data, spectra, ref_freq, top_n=10):
+    """Find the most consonant triads (local minima of the dissonance surface).
+
+    *z_data* is indexed ``[voice B index, voice C index]``.  Every grid local
+    minimum seeds a search on the exact model, so results aren't snapped to the
+    grid and the aliasing ripples a grid leaves along narrow valleys merge into
+    the true minimum they belong to.  Minima that run off the grid are dropped.
+    Results are sorted by dissonance (lowest first) and capped at *top_n*.
     """
     nx, ny = z_data.shape
+    if nx < 3 or ny < 3:
+        return np.array([]), np.array([]), np.array([])
     # The surface is symmetric only when B and C share a spectrum; mirrored pairs
     # are duplicate voicings then, and genuinely different chords otherwise.
     mirrored = nx == ny and np.allclose(z_data, z_data.T)
-    win = 2 * window + 1
-    if nx < win or ny < win:
-        return np.array([]), np.array([]), np.array([])
 
-    # A square-window minimum is separable: min over rows, then over columns.
-    row_min = np.lib.stride_tricks.sliding_window_view(z_data, win, axis=0).min(axis=-1)
-    patch_min = np.lib.stride_tricks.sliding_window_view(row_min, win, axis=1).min(axis=-1)
-    core = z_data[window:nx - window, window:ny - window]
-    ii, jj = np.nonzero(core == patch_min)
-    candidates = zip(ii + window, jj + window)
+    padded = np.pad(z_data, 1, constant_values=np.inf)
+    neighbours = np.min([padded[1 + di:nx + 1 + di, 1 + dj:ny + 1 + dj]
+                         for di in (-1, 0, 1) for dj in (-1, 0, 1)
+                         if di or dj], axis=0)
+    seeds = zip(*np.nonzero(z_data <= neighbours))
 
-    results = []
+    cost = _triad_cost(*spectra, ref_freq)
+    peak = np.unravel_index(np.argmax(z_data), z_data.shape)
+    norm = cost(np.log(ratios_x[peak[0]]), np.log(ratios_y[peak[1]])) / z_data[peak]
+    lo = (np.log(ratios_x[0]), np.log(ratios_y[0]))
+    hi = (np.log(ratios_x[-1]), np.log(ratios_y[-1]))
+    step = float(ratios_x[1] - ratios_x[0])
+    same = 2.0 / 1200 * np.log(2)  # minima within 2 cents on both axes are one chord
+
+    found = []
     tol = 0.02  # tolerance for "same note" check
-    for i, j in candidates:
-        bx = ratios_x[i]
-        cy = ratios_y[j]
+    for i, j in seeds:
+        hit = _descend(cost, np.log(ratios_x[i]), np.log(ratios_y[j]), step, lo, hi)
+        if hit is None:
+            continue
+        u, v, val = hit
+        if mirrored and u < v:
+            u, v = v, u
+        bx, cy = np.exp(u), np.exp(v)
         # Skip triads where two voices are effectively the same pitch
         if abs(bx - 1.0) < tol or abs(cy - 1.0) < tol or abs(bx - cy) < tol:
             continue
-        if mirrored and bx < cy:
+        if any(abs(u - fu) < same and abs(v - fv) < same for fu, fv, _ in found):
             continue
-        results.append((bx, cy, z_data[i, j]))
+        found.append((u, v, val / norm))
 
+    results = [(np.exp(u), np.exp(v), z) for u, v, z in found]
     if not results:
         return np.array([]), np.array([]), np.array([])
 
@@ -362,7 +409,7 @@ def write_wav(path, signal, sample_rate=SAMPLE_RATE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Interval labelling  (unchanged)
+#  Interval labelling and presets
 # ═══════════════════════════════════════════════════════════════════════════
 
 INTERVAL_LABELS = [
@@ -397,31 +444,46 @@ def ratio_to_cents(ratio):
 
 PRESETS = [
     ("Harmonic", [1, 2, 3, 4, 5, 6], [1, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 6]),
-    ("Odd harmonics (square)", [1, 3, 5, 7, 9, 11],
+    ("Pan Flute (Odd Harmonics)", [1, 3, 5, 7, 9, 11],
      [1, 1 / 3, 1 / 5, 1 / 7, 1 / 9, 1 / 11]),
-    ("Free beam (glockenspiel)", [1, 2.758, 5.406, 8.936, 13.35, 18.645],
+    ("Glockenspiel (Ideal Bar)", [1, 2.758, 5.406, 8.936, 13.35, 18.645],
      [0.88 ** i for i in range(6)]),
     ("Bonang", [1, 1.52, 3.46, 3.92], [0.88 ** i for i in range(4)]),
+    ("Saron (Swastigitha)", [1, 2.76, 4.72, 5.92], [0.88 ** i for i in range(4)]),
+    ("Saron (Kyai Kaduk Manis)", [1, 2.39, 2.78, 4.75, 5.08, 5.96],
+     [0.88 ** i for i in range(6)]),
 ]
 
 PRESET_NOTES = {
     "Harmonic":
         "Harmonic partials 1\u20136 at 1/n: an ideal sawtooth, not a measured instrument.",
-    "Odd harmonics (square)":
-        "Odd partials 1\u201311 at 1/n: an ideal square wave. Real clarinets and pan flutes "
-        "are mostly odd but still have some even content.",
-    "Free beam (glockenspiel)":
+    "Pan Flute (Odd Harmonics)":
+        "Odd partials 1\u201311, as in Sethares' measured pan flute (TTSS Fig. 6.8); "
+        "clarinets are similar. Amplitudes are 1/n (an ideal square wave), not measured.",
+    "Glockenspiel (Ideal Bar)":
         "Free\u2013free Euler\u2013Bernoulli bar (mode ratios exact to <0.06%), "
         "like a glockenspiel bar. Real xylophone and marimba bars are undercut to retune "
         "these. Amplitudes are Sethares' generic 0.88\u207f roll-off.",
     "Bonang":
-        "Javanese kettle-gong after Sethares; 1, 1.52 and 3.46 match TTSS \u00a76.7, "
-        "3.92 is unconfirmed. Gamelans are individually tuned, so no spectrum is canonical. "
+        "Sethares' generic Javanese bonang kettle (TTSS \u00a710.3.3). Gamelans are "
+        "individually tuned, so no spectrum is canonical. Amplitudes are a generic "
+        "0.88\u207f roll-off, not measured; Sethares uses equal amplitudes (\u00a710.5.1).",
+    "Saron (Swastigitha)":
+        "Sethares' generic saron key for gamelan Swastigitha, the median of its consistent "
+        "partials (TTSS \u00a710.3.1). Near an ideal bar but with lower upper partials; he "
+        "pairs it with a harmonic tone to explain that gamelan's pelog (Fig. 10.11). "
+        "Amplitudes are a generic 0.88\u207f roll-off, not measured.",
+    "Saron (Kyai Kaduk Manis)":
+        "Sethares' generic saron for gamelan Kyai Kaduk Manis (1997), where the partials "
+        "near 2.7 and 4.8 split into close pairs, apparently by design (TTSS \u00a710.3.1). "
+        "Explains that gamelan's pelog with a harmonic tone (Fig. 10.12). "
         "Amplitudes are a generic 0.88\u207f roll-off, not measured.",
 }
 
-DEFAULT_FREQS = [1, 2, 3, 4, 5, 6]
-DEFAULT_AMPS = [1, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 6]
+
+def format_partials(values):
+    """The comma-separated text the spectrum fields use for a list of numbers."""
+    return ", ".join(f"{v:.4g}" for v in values)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -429,28 +491,27 @@ DEFAULT_AMPS = [1, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 6]
 # ═══════════════════════════════════════════════════════════════════════════
 
 DARK_PALETTE = dict(
-    CRUST="#0e0e16", BASE="#11111b", MANTLE="#181825", SURFACE="#1e1e2e",
+    BASE="#11111b", MANTLE="#181825", SURFACE="#1e1e2e",
     PANEL="#313244", LINE="#26263a", BORDER="#45475a", TEXT="#cdd6f4",
-    SUBTEXT="#a6adc8", MUTED="#6c7086", BLUE="#89b4fa", SKY="#89dceb",
-    YELLOW="#f9e2af", GREEN="#a6e3a1", RED="#f38ba8", MAUVE="#cba6f7",
-    PEACH="#fab387", CMAP="magma", PLOT_LW=2.0, GRID_ALPHA=0.12,
+    SUBTEXT="#a6adc8", MUTED="#6c7086", BLUE="#89b4fa",
+    YELLOW="#f9e2af", GREEN="#a6e3a1", RED="#f38ba8",
+    CMAP="magma", PLOT_LW=2.0, GRID_ALPHA=0.12,
     MARKER_EDGE="#ffffff", TICK_LEVEL=2,
     VOICE_A="#5aa9ff", VOICE_B="#ff8a3d", VOICE_C="#3ddc97",
 )
 
-# Okabe-Ito colourblind-safe accents on white; intended for print figures.
+# Okabe-Ito colourblind-safe accents on soft greys; figure exports still render on white.
 PAPER_PALETTE = dict(
-    CRUST="#ffffff", BASE="#ffffff", MANTLE="#ffffff", SURFACE="#f4f4f4",
-    PANEL="#c8c8c8", LINE="#dcdcdc", BORDER="#000000", TEXT="#000000",
-    SUBTEXT="#1a1a1a", MUTED="#555555", BLUE="#0072b2", SKY="#56b4e9",
-    YELLOW="#d55e00", GREEN="#009e73", RED="#b22222", MAUVE="#cc79a7",
-    PEACH="#e69f00", CMAP="viridis", PLOT_LW=1.6, GRID_ALPHA=0.25,
-    MARKER_EDGE="#000000", TICK_LEVEL=0,
+    BASE="#e1e3e7", MANTLE="#ebecef", SURFACE="#f2f3f5",
+    PANEL="#cdd0d6", LINE="#d2d5da", BORDER="#868b94", TEXT="#24262b",
+    SUBTEXT="#3a3d44", MUTED="#686d75", BLUE="#0072b2",
+    YELLOW="#d55e00", GREEN="#009e73", RED="#b22222",
+    CMAP="viridis", PLOT_LW=1.6, GRID_ALPHA=0.25,
+    MARKER_EDGE="#24262b", TICK_LEVEL=0,
     VOICE_A="#0072b2", VOICE_B="#d55e00", VOICE_C="#009e73",
 )
 
 # Declared explicitly so static analysis sees them; apply_palette() rebinds them.
-CRUST = DARK_PALETTE["CRUST"]
 BASE = DARK_PALETTE["BASE"]
 MANTLE = DARK_PALETTE["MANTLE"]
 SURFACE = DARK_PALETTE["SURFACE"]
@@ -461,12 +522,9 @@ TEXT = DARK_PALETTE["TEXT"]
 SUBTEXT = DARK_PALETTE["SUBTEXT"]
 MUTED = DARK_PALETTE["MUTED"]
 BLUE = DARK_PALETTE["BLUE"]
-SKY = DARK_PALETTE["SKY"]
 YELLOW = DARK_PALETTE["YELLOW"]
 GREEN = DARK_PALETTE["GREEN"]
 RED = DARK_PALETTE["RED"]
-MAUVE = DARK_PALETTE["MAUVE"]
-PEACH = DARK_PALETTE["PEACH"]
 CMAP = DARK_PALETTE["CMAP"]
 PLOT_LW = DARK_PALETTE["PLOT_LW"]
 GRID_ALPHA = DARK_PALETTE["GRID_ALPHA"]
@@ -499,8 +557,6 @@ QWidget {{
 QLabel {{ background: transparent; }}
 #plain {{ background: transparent; }}
 
-#appTitle   {{ font-size: 19px; font-weight: 700; color: {TEXT}; letter-spacing: 0.5px; }}
-#appSub     {{ font-size: 11px; color: {MUTED}; letter-spacing: 2.2px; font-weight: 600; }}
 #cardTitle  {{ font-size: 10px; font-weight: 700; color: {MUTED}; letter-spacing: 1.6px; }}
 #fieldLabel {{ font-size: 11px; color: {SUBTEXT}; font-weight: 600; }}
 #hint       {{ font-size: 11px; color: {MUTED}; }}
@@ -518,8 +574,6 @@ QLabel {{ background: transparent; }}
     border: 1px solid {LINE};
     border-radius: 14px;
 }}
-
-#dot {{ border-radius: 4px; }}
 
 QLineEdit, QComboBox, QDoubleSpinBox {{
     background: {SURFACE};
@@ -668,32 +722,18 @@ def diss_color(value):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class Card(QFrame):
-    """Rounded surface with an optional small-caps title."""
+    """Rounded surface with a small-caps title."""
 
-    def __init__(self, title=None, accent=None, parent=None):
+    def __init__(self, title, parent=None):
         super().__init__(parent)
         self.setObjectName("card")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 9, 12, 10)
         outer.setSpacing(7)
 
-        if title is not None:
-            head = QHBoxLayout()
-            head.setSpacing(8)
-            self.dot = None
-            if accent:
-                dot = QLabel()
-                dot.setObjectName("dot")
-                dot.setFixedSize(8, 8)
-                dot.setStyleSheet(f"background: {accent}; border-radius: 4px;")
-                head.addWidget(dot)
-                self.dot = dot
-            lbl = QLabel(title.upper())
-            lbl.setObjectName("cardTitle")
-            head.addWidget(lbl)
-            head.addStretch(1)
-            self.head = head
-            outer.addLayout(head)
+        lbl = QLabel(title.upper())
+        lbl.setObjectName("cardTitle")
+        outer.addWidget(lbl)
 
         self.body = QVBoxLayout()
         self.body.setSpacing(6)
@@ -724,17 +764,11 @@ class Segmented(QWidget):
             lay.addWidget(btn)
         self.group.idClicked.connect(self.changed.emit)
 
-    def setIndex(self, index):
-        btn = self.group.button(index)
-        if btn:
-            btn.setChecked(True)
-
 
 class Field(QWidget):
     """Labelled line edit; *inline* puts the label to the left."""
 
-    def __init__(self, label, value="", width=None, inline=False, label_width=74,
-                 parent=None):
+    def __init__(self, label, value="", inline=False, label_width=74, parent=None):
         super().__init__(parent)
         lay = QHBoxLayout(self) if inline else QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -745,8 +779,6 @@ class Field(QWidget):
             cap.setFixedWidth(label_width)
         lay.addWidget(cap)
         self.edit = QLineEdit(value)
-        if width:
-            self.edit.setFixedWidth(width)
         lay.addWidget(self.edit)
 
     def text(self):
@@ -858,29 +890,21 @@ class SpectrumCard(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(6)
-        if self.copy_sources:
-            self.copy_combo = QComboBox()
-            self.copy_combo.addItems(
-                [f"Same as {name}" for name, _ in self.copy_sources] + ["Custom"])
-            self.copy_combo.setCurrentIndex(0)
-            self.copy_combo.setSizeAdjustPolicy(
-                QComboBox.AdjustToMinimumContentsLengthWithIcon)
-            self.copy_combo.setMinimumContentsLength(6)
-            self.copy_combo.currentIndexChanged.connect(self._toggle_fields)
-            top.addWidget(self.copy_combo, 1)
-        else:
-            self.copy_combo = None
-        self.preset_combo = QComboBox()
-        self.preset_combo.setToolTip("Spectrum preset")
-        self.preset_combo.addItem("Custom")
-        self.preset_combo.addItems([p[0] for p in PRESETS])
-        for i, (name, _, _) in enumerate(PRESETS, start=1):
-            self.preset_combo.setItemData(i, PRESET_NOTES[name], Qt.ToolTipRole)
-        self.preset_combo.setSizeAdjustPolicy(
+        self.combo = QComboBox()
+        for i, (name, _) in enumerate(self.copy_sources):
+            self.combo.addItem(f"Same as {name}", f"link:{i}")
+            self.combo.setItemData(self.combo.count() - 1,
+                                   f"Mirror voice {name}; editing switches to Custom",
+                                   Qt.ToolTipRole)
+        for i, (name, _, _) in enumerate(PRESETS):
+            self.combo.addItem(name, f"preset:{i}")
+            self.combo.setItemData(self.combo.count() - 1, PRESET_NOTES[name],
+                                   Qt.ToolTipRole)
+        self.combo.addItem("Custom", "custom")
+        self.combo.setSizeAdjustPolicy(
             QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.preset_combo.setMinimumContentsLength(8)
-        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
-        top.addWidget(self.preset_combo, 1)
+        self.combo.setMinimumContentsLength(10)
+        top.addWidget(self.combo, 1)
         play_btn = QPushButton("\u25b6")
         play_btn.setObjectName("icon")
         play_btn.setToolTip(f"Play voice {letter} alone")
@@ -889,20 +913,11 @@ class SpectrumCard(QWidget):
         top.addWidget(play_btn, 0)
         lay.addLayout(top)
 
-        self.fields = QWidget()
-        self.fields.setObjectName("plain")
-        fl = QVBoxLayout(self.fields)
-        fl.setContentsMargins(0, 0, 0, 0)
-        fl.setSpacing(6)
-
-        self.freq_field = Field("Partials",
-                                ", ".join(f"{f:.4g}" for f in DEFAULT_FREQS),
-                                inline=True)
-        self.amp_field = Field("Amplitudes",
-                               ", ".join(f"{a:.4g}" for a in DEFAULT_AMPS),
-                               inline=True)
-        fl.addWidget(self.freq_field)
-        fl.addWidget(self.amp_field)
+        _, freqs, amps = PRESETS[0]
+        self.freq_field = Field("Partials", format_partials(freqs), inline=True)
+        self.amp_field = Field("Amplitudes", format_partials(amps), inline=True)
+        lay.addWidget(self.freq_field)
+        lay.addWidget(self.amp_field)
 
         self.preview = pg.PlotWidget()
         self.preview.setFixedHeight(34)
@@ -916,19 +931,22 @@ class SpectrumCard(QWidget):
         self._bars = pg.BarGraphItem(x=[0], height=[0], width=0.06,
                                      brush=pg.mkBrush(self.color))
         self.preview.addItem(self._bars)
-        fl.addWidget(self.preview)
-
-        lay.addWidget(self.fields)
+        lay.addWidget(self.preview)
         lay.addStretch(1)
 
-        self.freq_field.edit.textChanged.connect(self._refresh_preview)
-        self.amp_field.edit.textChanged.connect(self._refresh_preview)
-        self.freq_field.edit.textChanged.connect(self._sync_preset_label)
-        self.amp_field.edit.textChanged.connect(self._sync_preset_label)
+        self.freq_field.edit.textChanged.connect(self._on_text_changed)
+        self.amp_field.edit.textChanged.connect(self._on_text_changed)
+        # textEdited fires only for typing, not for text mirrored from the source.
+        self.freq_field.edit.textEdited.connect(self._detach)
+        self.amp_field.edit.textEdited.connect(self._detach)
+        for _, card in self.copy_sources:
+            card.freq_field.edit.textChanged.connect(self._sync_from_source)
+            card.amp_field.edit.textChanged.connect(self._sync_from_source)
 
-        self._toggle_fields()
-        self._refresh_preview()
-        self._sync_preset_label()
+        if not self.copy_sources:
+            self._select_by_text()
+        self._on_combo()
+        self.combo.currentIndexChanged.connect(self._on_combo)
 
     # ── behaviour ──────────────────────────────────────────────────────────
 
@@ -937,39 +955,70 @@ class SpectrumCard(QWidget):
         self.preview.setBackground(SURFACE)
         self._bars.setOpts(brush=pg.mkBrush(self.color))
 
+    def _kind(self):
+        kind, _, i = (self.combo.currentData() or "custom").partition(":")
+        return kind, int(i) if i else None
+
     def is_linked(self):
-        return self.copy_combo is not None and self.copy_combo.currentText() != "Custom"
+        return self._kind()[0] == "link"
 
-    def _toggle_fields(self):
-        custom = not self.is_linked()
-        self.fields.setVisible(custom)
-        self.preset_combo.setVisible(custom)
-        if not custom:
-            self._refresh_preview()
-        self.sourceChanged.emit()
+    def _source_card(self):
+        kind, i = self._kind()
+        return self.copy_sources[i][1] if kind == "link" else None
 
-    def _apply_preset(self, index):
-        if index <= 0:
-            return
-        _, freqs, amps = PRESETS[index - 1]
-        self.freq_field.edit.setText(", ".join(f"{f:.4g}" for f in freqs))
-        self.amp_field.edit.setText(", ".join(f"{a:.4g}" for a in amps))
+    def source_name(self):
+        kind, i = self._kind()
+        return self.copy_sources[i][0] if kind == "link" else None
 
-    def _sync_preset_label(self):
-        """Show the preset the fields match, or Custom once they've been edited."""
+    def _matched_preset(self):
         current = ("".join(self.freq_field.text().split()),
                    "".join(self.amp_field.text().split()))
-        index = 0
-        for i, (_, freqs, amps) in enumerate(PRESETS, start=1):
-            if current == (",".join(f"{f:.4g}" for f in freqs),
-                           ",".join(f"{a:.4g}" for a in amps)):
-                index = i
-                break
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentIndex(index)
-        self.preset_combo.blockSignals(False)
-        self.preset_combo.setToolTip(
-            PRESET_NOTES[PRESETS[index - 1][0]] if index else "Spectrum preset")
+        for i, (_, freqs, amps) in enumerate(PRESETS):
+            if current == (format_partials(freqs).replace(" ", ""),
+                           format_partials(amps).replace(" ", "")):
+                return i
+        return None
+
+    def _select_by_text(self):
+        """Point the menu at the preset the fields match, or Custom."""
+        i = self._matched_preset()
+        target = f"preset:{i}" if i is not None else "custom"
+        self.combo.blockSignals(True)
+        self.combo.setCurrentIndex(self.combo.findData(target))
+        self.combo.blockSignals(False)
+        self._update_tooltip()
+
+    def _update_tooltip(self):
+        tip = self.combo.itemData(self.combo.currentIndex(), Qt.ToolTipRole)
+        self.combo.setToolTip(tip or "Spectrum source")
+
+    def _sync_from_source(self):
+        src = self._source_card()
+        if src is not None:
+            self.freq_field.edit.setText(src.freq_field.text())
+            self.amp_field.edit.setText(src.amp_field.text())
+
+    def _detach(self):
+        if self.is_linked():
+            self._select_by_text()
+            self.sourceChanged.emit()
+
+    def _on_text_changed(self):
+        self._refresh_preview()
+        if not self.is_linked():
+            self._select_by_text()
+
+    def _on_combo(self, _index=None):
+        kind, i = self._kind()
+        if kind == "link":
+            self._sync_from_source()
+        elif kind == "preset":
+            _, freqs, amps = PRESETS[i]
+            self.freq_field.edit.setText(format_partials(freqs))
+            self.amp_field.edit.setText(format_partials(amps))
+        self._update_tooltip()
+        self._refresh_preview()
+        self.sourceChanged.emit()
 
     def _refresh_preview(self):
         spec = self.get_spectrum()
@@ -990,11 +1039,9 @@ class SpectrumCard(QWidget):
 
     def get_spectrum(self):
         """Spectrum dict, copied source, or None when the text is invalid."""
-        if self.copy_combo is not None and self.copy_combo.currentText() != "Custom":
-            for name, card in self.copy_sources:
-                if self.copy_combo.currentText() == f"Same as {name}":
-                    return card.get_spectrum()
-            return None
+        src = self._source_card()
+        if src is not None:
+            return src.get_spectrum()
         try:
             freqs = [float(x.strip()) for x in self.freq_field.text().split(',')]
             amps = [float(x.strip()) for x in self.amp_field.text().split(',')]
@@ -1017,15 +1064,24 @@ class SmoothImageItem(pg.ImageItem):
         super().paint(p, *args)
 
 
+class CornerZoomViewBox(pg.ViewBox):
+    """Zooms (wheel and right-drag) about the bottom-left corner, so only the top and right move."""
+
+    def scaleBy(self, s=None, center=None, x=None, y=None):
+        r = self.targetRect().normalized()
+        super().scaleBy(s, pg.Point(r.left(), r.top()), x, y)
+
+
 class CurveView(pg.PlotWidget):
     """2D dissonance curve with crosshair readout."""
 
     picked = Signal(float)
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, viewBox=CornerZoomViewBox())
         pi = self.getPlotItem()
         pi.setMenuEnabled(False)
+        pi.setMouseEnabled(x=True, y=False)
 
         self._curve = pi.plot([], [], fillLevel=0.0)
         self._dots = pg.ScatterPlotItem(size=9)
@@ -1044,7 +1100,6 @@ class CurveView(pg.PlotWidget):
         self._y = None
         self._mx = None
         self._my = None
-        self._xmax = 2.3
 
         self.apply_palette()
         self.scene().sigMouseMoved.connect(self._on_move)
@@ -1084,6 +1139,7 @@ class CurveView(pg.PlotWidget):
         self._x, self._y = ratios, values
         self._mx, self._my = minima_x, minima_y
         self._curve.setData(ratios, values)
+        self.getPlotItem().vb.setLimits(xMin=float(ratios[0]), yMin=0.0)
         self._rebuild_labels()
         self.setViewRatioRange(xmax)
 
@@ -1106,10 +1162,9 @@ class CurveView(pg.PlotWidget):
 
     def setViewRatioRange(self, xmax):
         """Zoom to ratios 0.9..xmax and rescale y to what's actually visible."""
-        self._xmax = xmax
         if self._x is None or not len(self._x):
             return
-        self.setXRange(0.9, xmax, padding=0.01)
+        self.setXRange(float(self._x[0]), xmax, padding=0)
         visible = self._y[self._x <= xmax]
         top = float(np.max(visible)) if len(visible) else float(np.max(self._y))
         self.setYRange(0, top * 1.08, padding=0)
@@ -1248,14 +1303,15 @@ class HeatmapView(pg.PlotWidget):
         pi = self.getPlotItem()
         pi.setMenuEnabled(False)
         pi.setAspectLocked(True)
+        # Headroom so the top colour-bar tick label isn't clipped by the widget edge.
+        pi.layout.setContentsMargins(1, 10, 1, 1)
 
-        self.cmap = _magma()
+        self.cmap = _theme_cmap()
         self.img = SmoothImageItem()
         self.img.setColorMap(self.cmap)
         pi.addItem(self.img)
 
-        self.bar = pg.ColorBarItem(colorMap=self.cmap, interactive=False,
-                                   label='Sensory dissonance', width=12)
+        self.bar = _dissonance_colorbar(colorMap=self.cmap)
         self.bar.setImageItem(self.img, insert_in=pi)
 
         self._iso = []
@@ -1279,14 +1335,9 @@ class HeatmapView(pg.PlotWidget):
             ax = pi.getAxis(axis)
             ax.setPen(pg.mkPen(BORDER))
             ax.setTextPen(pg.mkPen(SUBTEXT))
-        self.bar.axis.setPen(pg.mkPen(BORDER))
-        self.bar.axis.setTextPen(pg.mkPen(SUBTEXT))
-        # ColorBarItem puts its tick values on one axis and the caption on the
-        # opposite one, so the caption has to be recoloured separately.
-        self.bar.getAxis('left').setLabel('Sensory dissonance', color=SUBTEXT)
-        self.cmap = _magma()
+        self.cmap = _theme_cmap()
         self.img.setColorMap(self.cmap)
-        self.bar.setColorMap(self.cmap)
+        _style_colorbar(self.bar, self.cmap)
         self._dots.setBrush(pg.mkBrush(YELLOW))
 
     def setData(self, x, y, z, tri_x, tri_y, tri_z):
@@ -1342,7 +1393,42 @@ class HeatmapView(pg.PlotWidget):
         self.picked.emit(float(p.x()), float(p.y()))
 
 
-def _magma():
+class ColorBarStrip(pg.GraphicsLayoutWidget):
+    """Stand-alone dissonance colour bar styled like the heatmap's."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ci.layout.setContentsMargins(4, 10, 4, 10)
+        self.bar = _dissonance_colorbar(values=(0.0, 1.0), colorMap=_theme_cmap())
+        self.addItem(self.bar)
+        self.setFixedWidth(84)
+        self.apply_palette()
+
+    def setLevels(self, lo, hi):
+        self.bar.setLevels((lo, hi))
+
+    def apply_palette(self):
+        self.setBackground(MANTLE)
+        _style_colorbar(self.bar, _theme_cmap())
+
+
+def _dissonance_colorbar(**kwargs):
+    bar = pg.ColorBarItem(interactive=False, label='Sensory dissonance', width=12, **kwargs)
+    # Let the end tick labels draw into the margin instead of being hidden.
+    bar.axis.setStyle(hideOverlappingLabels=False)
+    return bar
+
+
+def _style_colorbar(bar, cmap):
+    bar.axis.setPen(pg.mkPen(BORDER))
+    bar.axis.setTextPen(pg.mkPen(SUBTEXT))
+    # ColorBarItem puts its tick values on one axis and the caption on the
+    # opposite one, so the caption has to be recoloured separately.
+    bar.getAxis('left').setLabel('Sensory dissonance', color=SUBTEXT)
+    bar.setColorMap(cmap)
+
+
+def _theme_cmap():
     # Name comes from the active palette; pyqtgraph bundles magma and viridis.
     for name in (CMAP, 'magma', 'CET-L8', 'CET-L16'):
         try:
@@ -1352,6 +1438,12 @@ def _magma():
         if cmap is not None:
             return cmap
     raise RuntimeError('pyqtgraph has no usable colormap installed')
+
+
+def _to_unit(values, axis):
+    """Map *values* on the ratio *axis* to GL scene coordinates in [-1, 1]."""
+    lo, hi = axis[0], axis[-1]
+    return (np.asarray(values, dtype=float) - lo) / max(hi - lo, 1e-12) * 2.0 - 1.0
 
 
 if HAS_GL:
@@ -1398,7 +1490,7 @@ if HAS_GL:
             self._press = None
             self._x = self._y = self._z = None
             self._zs = None
-            self._cmap = _magma()
+            self._cmap = _theme_cmap()
             self.apply_palette()
 
         def apply_palette(self):
@@ -1407,7 +1499,7 @@ if HAS_GL:
             g = QColor(BORDER)
             g.setAlpha(110)
             self._grid.setColor(g)
-            self._cmap = _magma()
+            self._cmap = _theme_cmap()
             for t in self._text:
                 t.setData(color=QColor(SUBTEXT))
 
@@ -1478,10 +1570,7 @@ if HAS_GL:
                     self.addItem(t)
                     self._text.append(t)
 
-        @staticmethod
-        def _norm(values, axis):
-            lo, hi = axis[0], axis[-1]
-            return (np.asarray(values, dtype=float) - lo) / max(hi - lo, 1e-12) * 2.0 - 1.0
+        _norm = staticmethod(_to_unit)
 
         # ── picking ────────────────────────────────────────────────────────
 
@@ -1622,24 +1711,25 @@ class ComputeWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, spec_a, spec_b, spec_c, ref_freq, max_interval,
-                 step_2d, step_3d, max_2d, parent=None):
+                 step_2d, step_3d, parent=None):
         super().__init__(parent)
         self.args = (spec_a, spec_b, spec_c, ref_freq, max_interval,
-                     step_2d, step_3d, max(max_2d, max_interval))
+                     step_2d, step_3d)
 
     def run(self):
         (spec_a, spec_b, spec_c, ref_freq, max_interval,
-         step_2d, step_3d, max_2d) = self.args
+         step_2d, step_3d) = self.args
         try:
             ratios_2d, diss_2d = compute_dissonance_2d(
-                spec_a, spec_b, ref_freq, max_2d, step_2d)
+                spec_a, spec_b, ref_freq, max(CURVE_MAX, max_interval), step_2d)
             minima_x, minima_y = find_minima(ratios_2d, diss_2d)
 
             x3, y3, z3 = compute_dissonance_3d(
                 spec_a, spec_b, spec_c, ref_freq, max_interval, step_3d,
                 progress_callback=lambda p: self.progress.emit(int(p * 100)))
 
-            tx, ty, tz = find_minima_3d(x3, y3, z3, top_n=None)
+            tx, ty, tz = find_minima_3d(x3, y3, z3, (spec_a, spec_b, spec_c),
+                                        ref_freq, top_n=None)
         except Exception as exc:  # surfaced in the status bar
             self.failed.emit(str(exc))
             return
@@ -1654,11 +1744,7 @@ class ComputeWorker(QThread):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Figure export
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  Figure editor  (publication figures)
+#  Figure export  (publication figures)
 # ═══════════════════════════════════════════════════════════════════════════
 
 SCREEN_DPI = 96.0
@@ -1691,6 +1777,14 @@ FIGURE_DEFAULTS = {
 def _figure_label(x, mode):
     name = ratio_to_interval_name(x)
     return {"Ratio": f"{x:.3f}", "Interval name": name}.get(mode, f"{name}\n{x:.3f}")
+
+
+def _triad_figure_label(bx, cy, mode, newline="\n"):
+    ratios = f"{bx:.3f} : {cy:.3f}"
+    if mode == "Ratio":
+        return ratios
+    names = f"{ratio_to_interval_name(bx)} \u00b7 {ratio_to_interval_name(cy)}"
+    return names + newline + ratios if mode == "Both" else names
 
 
 def _pad_axis_label(ax, gap):
@@ -1830,14 +1924,8 @@ def make_figure(kind, data, st, ppi):
                                       brush=pg.mkBrush("#ffffff")))
     if st["labels"] != "None":
         for bx, cy in zip(tx, ty):
-            if st["labels"] == "Ratio":
-                text = f"{bx:.3f} : {cy:.3f}"
-            else:
-                text = f"{ratio_to_interval_name(bx)} \u00b7 {ratio_to_interval_name(cy)}"
-                if st["labels"] == "Both":
-                    text += f"\n{bx:.3f} : {cy:.3f}"
-            t = pg.TextItem(text, color=black, anchor=(-0.08, 1.08),
-                            fill=pg.mkBrush(255, 255, 255, 210))
+            t = pg.TextItem(_triad_figure_label(bx, cy, st["labels"]), color=black,
+                            anchor=(-0.08, 1.08), fill=pg.mkBrush(255, 255, 255, 210))
             t.setFont(font(0.75))
             t.setPos(bx, cy)
             pi.addItem(t, ignoreBounds=True)
@@ -2205,10 +2293,7 @@ class SurfaceRenderer:
         self.view.close()
         self.view.deleteLater()
 
-    @staticmethod
-    def unit(values, axis):
-        lo, hi = axis[0], axis[-1]
-        return (np.asarray(values, dtype=float) - lo) / max(hi - lo, 1e-12) * 2.0 - 1.0
+    unit = staticmethod(_to_unit)
 
     def _sync(self, st):
         key = (st["cmap"], st["shading"], st["floor"], round(st["zscale"], 4))
@@ -2504,12 +2589,7 @@ def paint_surface_figure(p, renderer, st, W, H, ppi, img_scale=1.0, final=False)
                     p.drawEllipse(q, r, r)
                     p.setBrush(Qt.NoBrush)
                 if st["labels"] != "None":
-                    if st["labels"] == "Ratio":
-                        text = f"{tx[k]:.3f} : {ty[k]:.3f}"
-                    else:
-                        text = f"{ratio_to_interval_name(tx[k])} \u00b7 {ratio_to_interval_name(ty[k])}"
-                        if st["labels"] == "Both":
-                            text += f"<br>{tx[k]:.3f} : {ty[k]:.3f}"
+                    text = _triad_figure_label(tx[k], ty[k], st["labels"], newline="<br>")
                     doc = _html_doc(text, label_font)
                     s = doc.size()
                     box = QRectF(q.x() + 3 * pt, q.y() - s.height() - 2 * pt, s.width(), s.height())
@@ -2645,15 +2725,19 @@ class SurfaceEditor(FigureEditor):
             self.canvas.setWidget(self._preview)
         st = self.state
         W, H = round(st["width"] * SCREEN_DPI), round(st["height"] * SCREEN_DPI)
-        image = QImage(W, H, QImage.Format_ARGB32)
+        # Render at the screen's physical pixel density so scaled displays stay sharp.
+        dpr = self.devicePixelRatioF()
+        image = QImage(round(W * dpr), round(H * dpr), QImage.Format_ARGB32)
         image.fill(QColor("#ffffff"))
         p = QPainter(image)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         try:
-            paint_surface_figure(p, self._renderer, st, W, H, SCREEN_DPI)
+            paint_surface_figure(p, self._renderer, st, image.width(), image.height(),
+                                 SCREEN_DPI * dpr, final=True)
         finally:
             p.end()
+        image.setDevicePixelRatio(dpr)
         self._preview.setPixmap(QPixmap.fromImage(image))
         self._preview.setFixedSize(W, H)
         self.msg.setText(f"Actual size preview \u00b7 {st['width']:g} \u00d7 {st['height']:g} in")
@@ -2686,6 +2770,7 @@ class MainWindow(QMainWindow):
         self.data = None
         self.worker = None
         self._last_sound = None
+        self._shown_overtones = []
         self._dot_color = BLUE
         self._fig_state = {}
         self._surface_renderer = None
@@ -2818,7 +2903,7 @@ class MainWindow(QMainWindow):
         for i, card in enumerate((self.card_a, self.card_b, self.card_c)):
             text = card.letter
             if card.is_linked():
-                text += f" = {card.copy_combo.currentText().removeprefix('Same as ')}"
+                text += f" = {card.source_name()}"
             btn = self.voice_seg.group.button(i)
             btn.setText(text)
             btn.setStyleSheet(
@@ -2839,11 +2924,6 @@ class MainWindow(QMainWindow):
         self.view_hint = QLabel()
         self.view_hint.setObjectName("hint")
         top.addStretch(1)
-
-        self.range_seg = Segmented(["Default", "MAX (3 Octaves)"])
-        self.range_seg.setToolTip(f"Show the curve up to ratio {EXTENDED_MAX:g}")
-        self.range_seg.changed.connect(self._on_range_changed)
-        top.addWidget(self.range_seg, 0)
 
         self.btn_export = QPushButton("Save figure\u2026")
         self.btn_export.setCursor(Qt.PointingHandCursor)
@@ -2868,7 +2948,16 @@ class MainWindow(QMainWindow):
         self.surface_view = SurfaceView()
         self.heatmap_view = HeatmapView()
         self.stack.addWidget(self.curve_view)
-        self.stack.addWidget(self.surface_view)
+        surface_page = QWidget()
+        surface_page.setObjectName("plain")
+        sp = QHBoxLayout(surface_page)
+        sp.setContentsMargins(0, 0, 0, 0)
+        sp.setSpacing(0)
+        sp.addWidget(self.surface_view, 1)
+        self.surface_bar = ColorBarStrip()
+        self.surface_bar.setVisible(HAS_GL)
+        sp.addWidget(self.surface_bar, 0)
+        self.stack.addWidget(surface_page)
         self.stack.addWidget(self.heatmap_view)
         inner.addWidget(self.stack)
         col.addWidget(card, 1)
@@ -2926,7 +3015,6 @@ class MainWindow(QMainWindow):
         col.setSpacing(10)
 
         self.res_tabs = Segmented(["Intervals", "Triads"])
-        self.res_tabs.changed.connect(lambda i: self.res_stack.setCurrentIndex(i))
         col.addWidget(self.res_tabs, 0)
 
         card = QFrame()
@@ -2942,18 +3030,20 @@ class MainWindow(QMainWindow):
         sort_row.addWidget(self.sort_seg, 1)
 
         self.res_stack = QStackedWidget()
+        self.res_stack.setObjectName("plain")
 
         intervals_page = QWidget()
+        intervals_page.setObjectName("plain")
         ip = QVBoxLayout(intervals_page)
         ip.setContentsMargins(0, 0, 0, 0)
         ip.setSpacing(8)
         ip.addLayout(sort_row)
         self.list_intervals = ResultList()
-        self.list_intervals.activatedRow.connect(
-            lambda p: self._play_interval_ratio(p))
+        self.list_intervals.activatedRow.connect(self._play_interval_ratio)
         ip.addWidget(self.list_intervals, 1)
 
         triads_page = QWidget()
+        triads_page.setObjectName("plain")
         tp = QVBoxLayout(triads_page)
         tp.setContentsMargins(0, 0, 0, 0)
         tp.setSpacing(8)
@@ -2970,6 +3060,7 @@ class MainWindow(QMainWindow):
 
         self.res_stack.addWidget(intervals_page)
         self.res_stack.addWidget(triads_page)
+        self.res_tabs.changed.connect(self.res_stack.setCurrentIndex)
         inner.addWidget(self.res_stack)
         col.addWidget(card, 1)
 
@@ -3006,22 +3097,10 @@ class MainWindow(QMainWindow):
     def _switch_tab(self, index):
         self.stack.setCurrentIndex(index)
         self.view_hint.setText(self.VIEW_HINTS[index])
-        self.range_seg.setVisible(index == 0)
 
     def _view_xmax(self):
         """Upper ratio currently shown on the curve."""
-        mx = self.data["max_interval"] if self.data is not None else self.max_interval
-        if self.range_seg.group.checkedId() == 1:
-            return max(EXTENDED_MAX, mx)
-        return mx
-
-    def _apply_range(self):
-        self.curve_view.setViewRatioRange(self._view_xmax())
-        self._fill_intervals()
-
-    def _on_range_changed(self, _index):
-        if self.data is not None:
-            self._apply_range()
+        return self.data["max_interval"] if self.data is not None else self.max_interval
 
     def _reset_view(self):
         i = self.stack.currentIndex()
@@ -3073,10 +3152,9 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self._status("Computing dissonance space\u2026", YELLOW)
 
-        wide = max(EXTENDED_MAX, self.max_interval)
         self.worker = ComputeWorker(spec_a, spec_b, spec_c, self.ref_freq,
                                     self.max_interval, self.step_2d,
-                                    self.step_3d, max_2d=wide)
+                                    self.step_3d)
         self.worker.progress.connect(self.progress.setValue)
         self.worker.finished_ok.connect(self._on_results)
         self.worker.failed.connect(self._on_failed)
@@ -3124,8 +3202,8 @@ class MainWindow(QMainWindow):
         cy = self.data["tri_y"]
         dz = self.data["tri_z"]
         if self.triad_seg.group.checkedId() == 0:
-            # 10-cent guard: anything nearer than this just reads as an octave.
-            octave = 2.0 * 2 ** (-10 / 1200)
+            # 20-cent guard: anything nearer than this just reads as an octave.
+            octave = 2.0 * 2 ** (-20 / 1200)
             keep = (bx < octave) & (cy < octave)
             bx, cy, dz = bx[keep], cy[keep], dz[keep]
         order = np.argsort(dz)[:limit]
@@ -3138,6 +3216,7 @@ class MainWindow(QMainWindow):
         d = self.data
         self.heatmap_view.setData(d["x_3d"], d["y_3d"], d["z_3d"], tx, ty, tz)
         self.surface_view.setData(d["x_3d"], d["y_3d"], d["z_3d"], tx, ty, tz)
+        self.surface_bar.setLevels(float(d["z_3d"].min()), float(d["z_3d"].max()))
         rows = [(f"1.000 : {bx:.3f} : {cy:.3f}",
                  f"{ratio_to_interval_name(bx)}  \u00b7  {ratio_to_interval_name(cy)}",
                  float(dz), (float(bx), float(cy)))
@@ -3155,7 +3234,7 @@ class MainWindow(QMainWindow):
         play_multi(voices, self.ref_freq)
 
     def _show_overtones(self):
-        shown = getattr(self, "_shown_overtones", None)
+        shown = self._shown_overtones
         if not shown:
             return
         matches = self.overtone_view.setVoices(shown, self.ref_freq)
@@ -3269,6 +3348,7 @@ class MainWindow(QMainWindow):
         self.curve_view.apply_palette()
         self.heatmap_view.apply_palette()
         self.surface_view.apply_palette()
+        self.surface_bar.apply_palette()
         self.overtone_view.apply_palette()
         self._show_overtones()
         self._set_dot(self._dot_color)
