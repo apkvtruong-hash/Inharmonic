@@ -4,3 +4,5 @@ sounddevice
 PySide6
 pyqtgraph
 PyOpenGL
+numba
+qtawesome

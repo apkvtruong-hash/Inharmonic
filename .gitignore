@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.nbi
+*.nbc
+.venv/
+build/
+dist/
+*.log
